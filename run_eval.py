@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM
 
 from time_moe.datasets.benchmark_dataset import BenchmarkEvalDataset, GeneralEvalDataset
 
+
 def setup_nccl(rank, world_size, master_addr='127.0.0.1', master_port=9899):
     dist.init_process_group("nccl", init_method='tcp://{}:{}'.format(master_addr, master_port), rank=rank,
                             world_size=world_size)

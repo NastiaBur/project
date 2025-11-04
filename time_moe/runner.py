@@ -12,6 +12,9 @@ from time_moe.models.modeling_time_moe import TimeMoeForPrediction, TimeMoeConfi
 from time_moe.trainer.hf_trainer import TimeMoETrainingArguments, TimeMoeTrainer
 from time_moe.utils.dist_util import get_world_size
 from time_moe.utils.log_util import logger, log_in_local_rank_0
+from transformers.integrations import CometCallback
+from comet_ml import Experiment
+import os
 
 
 class TimeMoeRunner:
@@ -58,6 +61,13 @@ class TimeMoeRunner:
 
     def train_model(self, from_scratch: bool = False, **kwargs):
         setup_seed(self.seed)
+
+        experiment = Experiment(
+            api_key=os.getenv("COMET_API_KEY"),
+            project_name="time-moe-tuning",
+            auto_output_logging="simple",
+            auto_metric_logging=True,
+        )
 
         train_config = kwargs
 
@@ -119,7 +129,7 @@ class TimeMoeRunner:
             num_train_epochs=num_train_epochs,
             # use_cpu=True,
             max_steps=train_steps,
-            evaluation_strategy=train_config.get("evaluation_strategy", 'no'),
+            # evaluation_strategy=train_config.get("evaluation_strategy", 'no'),
             eval_steps=_safe_float(train_config.get("eval_steps", None)),
             save_strategy=train_config.get("save_strategy", "no"),
             save_steps=_safe_float(train_config.get("save_steps", None)),
@@ -194,6 +204,10 @@ class TimeMoeRunner:
             args=training_args,
             train_dataset=train_ds,
         )
+
+        trainer.add_callback(CometCallback())
+        trainer.comet_experiment = experiment
+
         trainer.train()
         trainer.save_model(self.output_path)
         log_in_local_rank_0(f'Saving model to {self.output_path}')

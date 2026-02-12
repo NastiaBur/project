@@ -197,6 +197,12 @@ class TSGenerationMixin(GenerationMixin):
         else:
             return input_ids
 
+    def _extract_past_from_model_output(
+            self, outputs: ModelOutput, standardize_cache_format: bool = False
+    ):
+        """Extract past_key_values from model outputs for use in next generation step."""
+        return getattr(outputs, "past_key_values", None)
+
     def _update_model_kwargs_for_generation(
             self,
             outputs: ModelOutput,

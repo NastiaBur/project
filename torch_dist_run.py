@@ -8,6 +8,7 @@
 """
 import argparse
 import os
+import sys
 import torch
 
 
@@ -45,35 +46,48 @@ def parse_arbitrary_args(argv):
 
 
 def obtain_dist_env_dict():
-    num_gpus_per_node = os.getenv('LOCAL_WORLD_SIZE') or torch.cuda.device_count() or 1
-    num_nodes = os.getenv('WORLD_SIZE') or 1
-    rank = os.getenv('RANK') or 0
-    master_addr = os.getenv('MASTER_ADDR') or 'localhost'
-    master_port = os.getenv('MASTER_PORT') or 9899
+    # SLURM-provided world info
+    nnodes = int(os.environ.get("SLURM_NNODES", "1"))
+    node_rank = int(os.environ.get("SLURM_NODEID", "0"))
 
+    # GPUs allocated to this job should be visible here:
+    nproc_per_node = len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")) \
+        if os.environ.get("CUDA_VISIBLE_DEVICES") else torch.cuda.device_count()
+
+    master_addr = os.environ.get("MASTER_ADDR")
     if master_addr is None:
-        return None
-    else:
-        return {
-            'master_addr': master_addr,
-            'master_port': master_port,
-            'world_size': num_nodes,
-            'rank': rank,
-            'local_world_size': num_gpus_per_node,
-        }
+        # pick first node in job as master
+        nodelist = os.environ.get("SLURM_JOB_NODELIST", "localhost")
+        # simplest: let SLURM resolve it
+        master_addr = os.popen(f"scontrol show hostnames {nodelist} | head -n 1").read().strip() or "localhost"
+
+    master_port = os.environ.get("MASTER_PORT", "9899")
+
+    return {
+        "master_addr": master_addr,
+        "master_port": master_port,
+        "nnodes": nnodes,
+        "node_rank": node_rank,
+        "nproc_per_node": nproc_per_node,
+    }
+
 
 
 def auto_dist_run(main_file: str, argv: str):
     if torch.cuda.is_available():
         env_dict = obtain_dist_env_dict()
-        launch_cmd = ' '.join([
-            'torchrun',
+        env_dict = obtain_dist_env_dict()
+        launch_cmd = " ".join([
+            # "torchrun"
+            # Use the current interpreter to avoid relying on `torchrun` being on PATH
+            sys.executable, "-m", "torch.distributed.run",
             f'--master_addr={env_dict["master_addr"]}',
             f'--master_port={env_dict["master_port"]}',
-            f'--node_rank={env_dict["rank"]}',
-            f'--nproc_per_node={env_dict["local_world_size"]}',
-            f'--nnodes={env_dict["world_size"]}',
+            f'--node_rank={env_dict["node_rank"]}',
+            f'--nproc_per_node={env_dict["nproc_per_node"]}',
+            f'--nnodes={env_dict["nnodes"]}',
         ])
+
 
         executed_cmd = launch_cmd + f' {main_file} {argv}'
     else:

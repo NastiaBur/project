@@ -2,6 +2,7 @@
 # -*- coding:utf-8 _*-
 import json
 import os
+import sys
 import argparse
 import numpy as np
 import logging
@@ -13,6 +14,35 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
 from time_moe.datasets.benchmark_dataset import BenchmarkEvalDataset, GeneralEvalDataset
+
+
+def plot_eval_metrics(mse_per_batch, mae_per_batch, loss_per_batch, save_path):
+    """Plot MSE, MAE and loss per batch and save to save_path."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logging.warning("matplotlib not installed; skipping plot. Install with: pip install matplotlib")
+        return
+
+    steps = np.arange(1, len(mse_per_batch) + 1)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(steps, mse_per_batch, label="MSE", color="C0", alpha=0.9)
+    ax.plot(steps, mae_per_batch, label="MAE", color="C1", alpha=0.9)
+    ax.plot(steps, loss_per_batch, label="Loss (Smooth L1)", color="C2", alpha=0.9)
+    ax.set_xlabel("Batch (step)")
+    ax.set_ylabel("Metric value")
+    ax.set_title("Evaluation metrics per batch")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plot_dir = os.path.dirname(save_path)
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    logging.info(f"Saved metrics plot to {save_path}")
 
 
 def setup_nccl(rank, world_size, master_addr='127.0.0.1', master_port=9899):
@@ -51,25 +81,45 @@ class MAEMetric(SumEvalMetric):
 
 
 class TimeMoE:
-    def __init__(self, model_path, device, context_length, prediction_length, **kwargs):
+    def __init__(self, model_path, device, context_length, prediction_length, temporal_mixer=None, **kwargs):
         try:
-            from time_moe.models.modeling_time_moe import TimeMoeForPrediction
-            model = TimeMoeForPrediction.from_pretrained(
-                model_path,
-                device_map=device,
-                # attn_implementation='flash_attention_2',
-                torch_dtype='auto',
-            )
-        except:
+            # Ensure black_mamba is on sys.path before loading Mamba model (must be before first time_moe import)
+            if temporal_mixer == 'mamba':
+                _eval_dir = os.path.dirname(os.path.abspath(__file__))
+                _black_mamba = os.path.join(_eval_dir, 'black_mamba')
+                if os.path.exists(_black_mamba) and _black_mamba not in sys.path:
+                    sys.path.insert(0, _black_mamba)
+            from time_moe.models.modeling_time_moe import TimeMoeForPrediction, MAMBA_AVAILABLE
+            from time_moe.models.configuration_time_moe import TimeMoeConfig
+            if temporal_mixer == 'mamba' and not MAMBA_AVAILABLE:
+                raise ImportError(
+                    "Mamba model requested (--temporal_mixer mamba) but black_mamba could not be loaded. "
+                    "Run from the project root so 'black_mamba' is found, install black_mamba deps (e.g. causal_conv1d, einops), "
+                    "and ensure CUDA extensions are built if needed."
+                )
+            load_kw = dict(device_map=device, dtype='auto')
+            if temporal_mixer is not None:
+                config = TimeMoeConfig.from_pretrained(model_path, temporal_mixer=temporal_mixer)
+                load_kw['config'] = config
+            model = TimeMoeForPrediction.from_pretrained(model_path, **load_kw)
+        except ImportError as e:
+            if "mamba" in str(e).lower() or "MAMBA" in str(e):
+                raise
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 device_map=device,
-                # attn_implementation='flash_attention_2',
-                torch_dtype='auto',
+                dtype='auto',
+                trust_remote_code=True,
+            )
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map=device,
+                dtype='auto',
                 trust_remote_code=True,
             )
 
-        logging.info(f'>>> Model dtype: {model.dtype}; Attention:{model.config._attn_implementation}')
+        logging.info(f'>>> Model dtype: {model.dtype}; Temporal mixer: {getattr(model.config, "temporal_mixer", "N/A")}; Attention: {model.config._attn_implementation}')
 
         self.model = model
         self.device = device
@@ -125,7 +175,8 @@ def evaluate(args):
         args.model,
         device,
         context_length=context_length,
-        prediction_length=prediction_length
+        prediction_length=prediction_length,
+        temporal_mixer=getattr(args, 'temporal_mixer', None),
     )
     if args.data.endswith('.csv'):
         dataset = BenchmarkEvalDataset(
@@ -155,6 +206,11 @@ def evaluate(args):
     )
 
     acc_count = 0
+    mse_per_batch = []
+    mae_per_batch = []
+    loss_per_batch = []
+    all_preds = [] if (getattr(args, 'predictions_path', None) and (not is_dist or rank == 0)) else None
+    all_labels = [] if all_preds is not None else None
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(test_dl)):
             preds, labels = model.predict(batch)
@@ -163,6 +219,18 @@ def evaluate(args):
                 metric.push(preds, labels)
 
             acc_count += count_num_tensor_elements(preds)
+
+            # Per-batch metrics for plotting (rank 0 only when distributed)
+            if not is_dist or rank == 0:
+                mse_b = torch.mean((preds - labels) ** 2).item()
+                mae_b = torch.mean(torch.abs(preds - labels)).item()
+                loss_b = torch.nn.functional.smooth_l1_loss(preds, labels, reduction="mean").item()
+                mse_per_batch.append(mse_b)
+                mae_per_batch.append(mae_b)
+                loss_per_batch.append(loss_b)
+                if all_preds is not None:
+                    all_preds.append(preds.cpu())
+                    all_labels.append(labels.cpu())
 
     ret_metric = {}
     for metric in metric_list:
@@ -191,6 +259,21 @@ def evaluate(args):
             val = all_stat[i] / count
             item[metric.name] = float(val.cpu().numpy())
         logging.info(item)
+
+        if getattr(args, 'plot_path', None):
+            plot_eval_metrics(mse_per_batch, mae_per_batch, loss_per_batch, args.plot_path)
+
+        if getattr(args, 'predictions_path', None) and all_preds is not None:
+            preds_arr = np.concatenate([p.numpy() for p in all_preds], axis=0)
+            labels_arr = np.concatenate([l.numpy() for l in all_labels], axis=0)
+            out_path = args.predictions_path.strip()
+            if not out_path.endswith('.npz'):
+                out_path = out_path + '.npz'
+            out_dir = os.path.dirname(out_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            np.savez(out_path, predictions=preds_arr, labels=labels_arr)
+            logging.info(f'Saved predictions and labels to {out_path} (shape: predictions {preds_arr.shape}, labels {labels_arr.shape})')
 
 
 if __name__ == '__main__':
@@ -223,6 +306,25 @@ if __name__ == '__main__':
         type=int,
         default=96,
         help='Prediction length'
+    )
+    parser.add_argument(
+        '--plot_path',
+        type=str,
+        default=None,
+        help='If set, save a plot of MSE, MAE and loss per batch to this path (e.g. plots/eval_metrics.png)'
+    )
+    parser.add_argument(
+        '--predictions_path',
+        type=str,
+        default=None,
+        help='If set, save predictions and labels to this path as a .npz file (e.g. results/preds.npz). Load with np.load(path)[\"predictions\"] and [\"labels\"]'
+    )
+    parser.add_argument(
+        '--temporal_mixer',
+        type=str,
+        default=None,
+        choices=['attn', 'mamba'],
+        help='Override architecture when loading the checkpoint. Usually not needed: the model uses the config saved in the checkpoint. Set to "mamba" if the checkpoint was trained with Mamba but config.json has temporal_mixer="attn".'
     )
     args = parser.parse_args()
     if args.context_length is None:

@@ -1,4 +1,13 @@
 import argparse
+import os
+import sys
+
+# Ensure black_mamba is on path before time_moe is imported (needed when --temporal_mixer mamba)
+_main_dir = os.path.dirname(os.path.abspath(__file__))
+_black_mamba = os.path.join(_main_dir, 'black_mamba')
+if os.path.exists(_black_mamba) and _black_mamba not in sys.path:
+    sys.path.insert(0, _black_mamba)
+
 from time_moe.runner import TimeMoeRunner
 
 
@@ -118,6 +127,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--temporal_mixer", type=str, default=None
+    )
+    parser.add_argument(
+        "--plot_path", type=str, default=None
+    )
+    parser.add_argument(
         "--logging_steps", type=int, default=1, help="number of steps to log"
     )
     parser.add_argument(
@@ -162,6 +177,7 @@ if __name__ == "__main__":
         data_path=args.data_path,
         normalization_method=args.normalization_method,
         attn_implementation=args.attn_implementation,
+        temporal_mixer=args.temporal_mixer,
         micro_batch_size=args.micro_batch_size,
         global_batch_size=args.global_batch_size,
         train_steps=args.train_steps,

@@ -4,6 +4,9 @@ import random
 from functools import reduce
 from operator import mul
 
+# Import comet_ml before torch to avoid warnings
+import comet_ml  # noqa: F401
+
 import torch
 
 from time_moe.datasets.time_moe_dataset import TimeMoEDataset
@@ -12,9 +15,6 @@ from time_moe.models.modeling_time_moe import TimeMoeForPrediction, TimeMoeConfi
 from time_moe.trainer.hf_trainer import TimeMoETrainingArguments, TimeMoeTrainer
 from time_moe.utils.dist_util import get_world_size
 from time_moe.utils.log_util import logger, log_in_local_rank_0
-from transformers.integrations import CometCallback
-from comet_ml import Experiment
-import os
 
 
 class TimeMoeRunner:
@@ -31,8 +31,12 @@ class TimeMoeRunner:
     def load_model(self, model_path: str = None, from_scatch: bool = False, **kwargs):
         if model_path is None:
             model_path = self.model_path
+        temporal_mixer = kwargs.pop('temporal_mixer', None)
         attn = kwargs.pop('attn_implementation', None)
-        if attn is None:
+        if temporal_mixer == 'mamba':
+            attn = 'mamba'
+            log_in_local_rank_0('Use Mamba temporal mixer')
+        elif attn is None:
             attn = 'eager'
         elif attn == 'auto':
             # try to use flash-attention
@@ -48,12 +52,19 @@ class TimeMoeRunner:
             log_in_local_rank_0('Use Eager Attention')
         elif attn == 'flash_attention_2':
             log_in_local_rank_0('Use Flash Attention 2')
-        else:
+        elif attn != 'mamba':
             raise ValueError(f'Unknown attention method: {attn}')
         kwargs['attn_implementation'] = attn
 
         if from_scatch:
-            config = TimeMoeConfig.from_pretrained(model_path, _attn_implementation=attn)
+            config_kw = {}
+            if temporal_mixer is not None:
+                config_kw['temporal_mixer'] = temporal_mixer
+            # Don't set _attn_implementation when temporal_mixer is mamba - let config class handle it
+            # (it will set _attn_implementation='eager' for HF compatibility, but use temporal_mixer for layer selection)
+            if attn != 'mamba':
+                config_kw['_attn_implementation'] = attn
+            config = TimeMoeConfig.from_pretrained(model_path, **config_kw)
             model = TimeMoeForPrediction(config)
         else:
             model = TimeMoeForPrediction.from_pretrained(model_path, **kwargs)
@@ -61,13 +72,6 @@ class TimeMoeRunner:
 
     def train_model(self, from_scratch: bool = False, **kwargs):
         setup_seed(self.seed)
-
-        experiment = Experiment(
-            api_key=os.getenv("COMET_API_KEY"),
-            project_name="time-moe-tuning",
-            auto_output_logging="simple",
-            auto_metric_logging=True,
-        )
 
         train_config = kwargs
 
@@ -124,6 +128,10 @@ class TimeMoeRunner:
         log_in_local_rank_0(f'Set precision to {precision}')
         log_in_local_rank_0(f'Set normalization to {train_config["normalization_method"]}')
 
+        comet_api_key = (os.getenv("COMET_API_KEY") or "").strip()
+        enable_comet = bool(comet_api_key) and comet_api_key not in {"YOUR_KEY_HERE", "..."}
+        report_to = ["comet_ml"] if enable_comet else []
+
         training_args = TimeMoETrainingArguments(
             output_dir=self.output_path,
             num_train_epochs=num_train_epochs,
@@ -153,6 +161,8 @@ class TimeMoeRunner:
             logging_first_step=True,
             log_on_each_node=False,
             logging_steps=int(train_config.get('logging_steps', 1)),
+            report_to=report_to,
+            run_name=os.getenv("COMET_EXPERIMENT_NAME") if enable_comet else None,
             seed=self.seed,
             data_seed=self.seed,
             max_grad_norm=train_config.get('max_grad_norm', 1.0),
@@ -173,6 +183,7 @@ class TimeMoeRunner:
                 from_scatch=from_scratch,
                 torch_dtype=torch_dtype,
                 attn_implementation=train_config.get('attn_implementation', 'eager'),
+                temporal_mixer=train_config.get('temporal_mixer'),
             )
             log_in_local_rank_0(f'Load model parameters from: {model_path}')
         else:
@@ -186,6 +197,9 @@ class TimeMoeRunner:
         log_in_local_rank_0(train_config)
         log_in_local_rank_0(training_args)
         log_in_local_rank_0(model.config)
+        # Verify temporal mixer is set correctly
+        tm = getattr(model.config, 'temporal_mixer', None)
+        log_in_local_rank_0(f'>>> Model temporal_mixer: {tm} (should be "mamba" for Mamba training)')
         log_in_local_rank_0(f'Number of the model parameters: {length_to_str(num_total_params)}')
 
         if train_steps > 0:
@@ -204,9 +218,6 @@ class TimeMoeRunner:
             args=training_args,
             train_dataset=train_ds,
         )
-
-        trainer.add_callback(CometCallback())
-        trainer.comet_experiment = experiment
 
         trainer.train()
         trainer.save_model(self.output_path)

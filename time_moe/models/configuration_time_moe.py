@@ -28,6 +28,10 @@ class TimeMoeConfig(PretrainedConfig):
             apply_aux_loss: bool = True,
             router_aux_loss_factor: float = 0.02,
             tie_word_embeddings: bool = False,
+            temporal_mixer: str = "attn",
+            mamba_d_conv: int = 4,
+            mamba_d_state: int = 16,
+            mamba_expand: int = 2,
             **kwargs,
     ):
         self.input_size = input_size
@@ -55,8 +59,26 @@ class TimeMoeConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.apply_aux_loss = apply_aux_loss
         self.router_aux_loss_factor = router_aux_loss_factor
+        self.temporal_mixer = temporal_mixer
+        self.mamba_d_conv = mamba_d_conv
+        self.mamba_d_state = mamba_d_state
+        self.mamba_expand = mamba_expand
 
         assert self.use_dense ^ self.apply_aux_loss, 'Both use_dense and apply_aux_loss cannot be set to True or False at the same time.'
+
+        # Set _attn_implementation for HuggingFace compatibility. HF only allows eager/flash_attention_*.
+        # When temporal_mixer is "mamba" we use eager here so HF's check passes; the model uses
+        # config.temporal_mixer to select the actual layer (Mamba vs attention).
+        if temporal_mixer == "mamba":
+            # Always set _attn_implementation='eager' when using Mamba (for HF compatibility)
+            kwargs['_attn_implementation'] = 'eager'
+        elif kwargs.get('_attn_implementation') == 'mamba':
+            # If someone passed _attn_implementation='mamba', convert to temporal_mixer='mamba' and set to eager
+            self.temporal_mixer = "mamba"
+            kwargs['_attn_implementation'] = 'eager'
+        elif '_attn_implementation' not in kwargs:
+            # Default to eager if not specified
+            kwargs['_attn_implementation'] = 'eager'
 
         kwargs.pop('tie_word_embeddings', None)
         super().__init__(

@@ -16,6 +16,26 @@ from .ts_generation_mixin import TSGenerationMixin
 
 logger = logging.get_logger(__name__)
 
+# Import mamba components (use abspath so path is correct regardless of cwd)
+# import sys
+# import os
+# _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# black_mamba_path = os.path.join(_project_root, 'black_mamba')
+# if os.path.exists(black_mamba_path) and black_mamba_path not in sys.path:
+#     sys.path.insert(0, black_mamba_path)
+# if os.path.exists(black_mamba_path):
+#     from black_mamba.mamba_layer import MambaLayer
+#     from black_mamba.mamba_config import MambaConfig
+#     MAMBA_AVAILABLE = True
+# else:
+#     MAMBA_AVAILABLE = False
+#     MambaLayer = None
+#     MambaConfig = None
+
+from black_mamba.mamba_layer import MambaLayer
+from black_mamba.mamba_config import MambaConfig
+MAMBA_AVAILABLE = True
+
 # if is_flash_attn_2_available():
 #     from flash_attn import flash_attn_func, flash_attn_varlen_func
 #     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -411,7 +431,8 @@ class TimeMoeAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # get_usable_length() was deprecated/removed; use get_seq_length() (optionally with layer_idx)
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -506,7 +527,8 @@ class TimeMoeFlashAttention2(TimeMoeAttention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            # get_usable_length() was deprecated/removed; use get_seq_length() (optionally with layer_idx)
+            kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -650,9 +672,99 @@ class TimeMoeFlashAttention2(TimeMoeAttention):
         )
 
 
+class TimeMoeMamba(nn.Module):
+    """
+    Mamba state-space model as a drop-in replacement for attention.
+    """
+
+    def __init__(self, config: TimeMoeConfig, layer_idx: Optional[int] = None):
+        super().__init__()
+        if not MAMBA_AVAILABLE:
+            msg = (
+                "Mamba is not available. Ensure the black_mamba folder is in the project root and "
+                "dependencies are installed: pip install causal_conv1d einops; "
+                "and build black_mamba if needed: pip install -e ./black_mamba"
+            )
+            if MAMBA_IMPORT_ERROR is not None:
+                raise ImportError(msg + f"\nOriginal error: {MAMBA_IMPORT_ERROR}") from MAMBA_IMPORT_ERROR
+            raise ImportError(msg)
+        
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        
+        # Create a MambaConfig object for MambaLayer
+        mamba_config = MambaConfig(
+            num_layers=getattr(config, "num_hidden_layers", 1),
+            hidden_size=config.hidden_size,
+            state_size=config.mamba_d_state,
+            expansion_factor=config.mamba_expand,
+            conv_dimension=config.mamba_d_conv,
+            conv_bias=True,
+            bias=True,
+            use_fast_path=True,
+            dt_rank="auto",
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            rms_norm=True,
+            fused_add_norm=False,
+            residual_in_fp32=True,
+            hidden_dropout=0.0,
+            ffn_hidden_size=None,
+            gated_linear_unit=False,
+            mamba_moe_layers="",
+            routing_mode="sinkhorn",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            fp32_residual_connection=False,
+            layernorm_epsilon=1e-5,
+            layernorm_zero_centered_gamma=False,
+            add_bias_linear=True,
+            activation_func=F.silu,
+            num_moe_experts=None,
+        )
+        
+        self.mamba_layer = MambaLayer(mamba_config, layer_idx=layer_idx)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Cache] = None,
+            output_attentions: bool = False,
+            **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass for Mamba layer.
+        
+        Note: Mamba doesn't use attention_mask, position_ids, or past_key_value in the same way as attention.
+        These parameters are accepted for interface compatibility but are mostly ignored.
+        """
+        # Mamba processes the hidden states directly
+        # Convert inference_params if past_key_value is provided
+        inference_params = None
+        if past_key_value is not None:
+            # For mamba, we need to handle state caching differently
+            # This is a simplified version - full implementation would need proper state management
+            pass
+        
+        attn_output = self.mamba_layer(hidden_states, inference_params=inference_params)
+        
+        # Mamba doesn't produce attention weights, so return None
+        attn_weights = None
+        
+        # For mamba, past_key_value handling is different (uses inference_params internally)
+        # Return None for compatibility
+        return attn_output, attn_weights, None
+
+
 TIME_MOE_ATTENTION_CLASSES = {
     "eager": TimeMoeAttention,
     'flash_attention_2': TimeMoeFlashAttention2,
+    'mamba': TimeMoeMamba,
 }
 
 
@@ -662,7 +774,12 @@ class TimeMoeDecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
 
-        self.self_attn = TIME_MOE_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        # Use temporal_mixer to select Mamba vs attention; HF only allows eager/flash for _attn_implementation
+        if getattr(config, 'temporal_mixer', None) == 'mamba':
+            attn_cls = TimeMoeMamba
+        else:
+            attn_cls = TIME_MOE_ATTENTION_CLASSES[config._attn_implementation]
+        self.self_attn = attn_cls(config, layer_idx)
 
         if self.config.use_dense:
             self.ffn_layer = TimeMoeMLP(
@@ -822,7 +939,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            # get_usable_length() was deprecated/removed; use get_seq_length()
+            past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -960,7 +1078,8 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             self.horizon_length_map[horizon_length] = i
         self.lm_heads = nn.ModuleList(lm_head_list)
 
-        self.loss_function = torch.nn.HuberLoss(reduction='none', delta=2.0)
+        # self.loss_function = torch.nn.HuberLoss(reduction='none', delta=2.0)
+        self.ar_loss_fn = torch.nn.HuberLoss(reduction='none', delta=2.0)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1095,7 +1214,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             shift_labels = labels
 
         # Calculate loss with mask
-        losses = self.loss_function(shift_predictions, shift_labels)
+        losses = self.ar_loss_fn(shift_predictions, shift_labels)
 
         if loss_masks is not None:
             losses = losses * loss_masks
@@ -1112,12 +1231,15 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                if isinstance(past_key_values, DynamicCache):
-                    past_length = past_key_values.seen_tokens
-                else:
-                    past_length = cache_length
+                # if isinstance(past_key_values, DynamicCache):
+                #     past_length = past_key_values.seen_tokens
+                # else:
+                #     past_length = cache_length
+                # Use get_seq_length() for all Cache types (DynamicCache.seen_tokens was deprecated/removed)
+                past_length = cache_length
 
-                max_cache_length = past_key_values.get_max_length()
+                # get_max_length() may not exist on all Cache types (e.g. DynamicCache in newer transformers)
+                max_cache_length = getattr(past_key_values, "get_max_length", lambda: None)()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None

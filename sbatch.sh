@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=2
 #SBATCH --cpus-per-task=8
-#SBATCH --time=1-12:00:00
+#SBATCH --time=2-04:00:00
 #SBATCH --mail-user=aaburkova_1@edu.hse.ru
 #SBATCH --mail-type=ALL
 #SBATCH --output=slurm-%j.out
@@ -33,6 +33,12 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 0:
     print("name:", torch.cuda.get_device_name(0))
 PY
 
+# Mamba CUDA deps must be installed on the LOGIN node (compute nodes often have no internet).
+# Run once before submitting jobs that use --temporal_mixer mamba:
+#   conda activate mama
+#   pip install causal-conv1d einops
+#   pip install -e /home/aaburkova_1/project-1/black_mamba
+
 # Scratch dir fallback (some clusters don't set SLURM_TMPDIR)
 SCRATCH_DIR=${SLURM_TMPDIR:-/tmp/$USER/$SLURM_JOB_ID}
 mkdir -p "$SCRATCH_DIR"
@@ -60,11 +66,11 @@ srun "$PY" /home/aaburkova_1/project-1/torch_dist_run.py \
   -d "$DATA_DST" \
   --from_scratch \
   --train_steps 50000 \
-  --output_path /home/aaburkova_1/project-1/logs/time_moe_mamba_small \
+  --output_path /home/aaburkova_1/project-1/logs/time_moe_attn2_small \
   --dataloader_num_workers 2 \
   --precision bf16 \
   --gradient_checkpointing \
   --micro_batch_size 8 \
   --global_batch_size 32 \
   --evaluation_strategy no \
-  --temporal_mixer mamba
+  --temporal_mixer attn

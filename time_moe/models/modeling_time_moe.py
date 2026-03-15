@@ -32,9 +32,16 @@ logger = logging.get_logger(__name__)
 #     MambaLayer = None
 #     MambaConfig = None
 
-from black_mamba.mamba_layer import MambaLayer
-from black_mamba.mamba_config import MambaConfig
-MAMBA_AVAILABLE = True
+# try:
+#     from black_mamba.mamba_layer import MambaLayer
+#     from black_mamba.mamba_config import MambaConfig
+#     MAMBA_AVAILABLE = True
+#     MAMBA_IMPORT_ERROR = None
+# except Exception as e:
+#     MambaLayer = None
+#     MambaConfig = None
+#     MAMBA_AVAILABLE = False
+#     MAMBA_IMPORT_ERROR = e
 
 # if is_flash_attn_2_available():
 #     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -44,6 +51,69 @@ try:
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 except:
     pass
+
+
+from dataclasses import dataclass
+
+@dataclass
+class SimpleMambaConfig:
+    hidden_size: int
+    state_size: int = 16
+    conv_kernel: int = 4
+    expand: int = 2
+    use_bias: bool = True
+    
+class SimpleMambaMixer(nn.Module):
+    def __init__(self, config: TimeMoeConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.expand = config.mamba_expand
+        self.conv_kernel = config.mamba_d_conv
+
+        inner_dim = self.hidden_size * self.expand
+        self.inner_dim = inner_dim
+
+        self.in_proj = nn.Linear(self.hidden_size, 2 * inner_dim, bias=True)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=inner_dim,
+            out_channels=inner_dim,
+            kernel_size=self.conv_kernel,
+            groups=inner_dim,
+            padding=self.conv_kernel - 1,
+            bias=True,
+        )
+
+        self.mix_proj = nn.Linear(inner_dim, inner_dim, bias=True)
+        self.out_proj = nn.Linear(inner_dim, self.hidden_size, bias=False)
+        self.act = nn.SiLU()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        **kwargs,
+    ):
+        B, L, D = hidden_states.shape
+
+        xz = self.in_proj(hidden_states)          # [B, L, 2*inner]
+        x, z = xz.chunk(2, dim=-1)                # [B, L, inner]
+
+        x = x.transpose(1, 2)                     # [B, inner, L]
+        x = self.conv1d(x)[..., :L]               # causal crop
+        x = x.transpose(1, 2)                     # [B, L, inner]
+
+        x = self.act(self.mix_proj(x))
+        x = x * torch.sigmoid(z)
+
+        out = self.out_proj(x)
+        return out, None, None
 
 
 def _get_unpad_data(attention_mask):
@@ -187,6 +257,59 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+class TimeMoeMambaMixer(nn.Module):
+    """
+    Mamba mixer used as a drop-in replacement for attention.
+    Input/output shape: [B, L, D]
+    """
+
+    def __init__(self, config: TimeMoeConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        # if not MAMBA_AVAILABLE:
+        #     msg = (
+        #         "temporal_mixer='mamba' requested, but BlackMamba is not available. "
+        #         "Install/build its CUDA dependencies first."
+        #     )
+        #     if MAMBA_IMPORT_ERROR is not None:
+        #         raise RuntimeError(msg + f"\nOriginal import error: {MAMBA_IMPORT_ERROR}") from MAMBA_IMPORT_ERROR
+        #     raise RuntimeError(msg)
+
+        mamba_config = MambaConfig(
+            num_layers=config.num_hidden_layers,
+            hidden_size=config.hidden_size,
+            state_size=config.mamba_d_state,
+            conv_dimension=config.mamba_d_conv,
+            expansion_factor=config.mamba_expand,
+            vocab_size=getattr(config, "vocab_size", 50000),
+            rms_norm=True,
+            fused_add_norm=False,
+            residual_in_fp32=True,
+            device="cuda",
+        )
+
+        self.mamba_layer = MambaLayer(mamba_config, layer_idx=layer_idx)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        # For now, ignore attention-specific args.
+        out = self.mamba_layer(hidden_states)
+
+        attn_weights = None
+        present_key_value = None
+        return out, attn_weights, present_key_value
 
 
 class TimeMoeInputEmbedding(nn.Module):
@@ -672,182 +795,74 @@ class TimeMoeFlashAttention2(TimeMoeAttention):
         )
 
 
-class TimeMoeMamba(nn.Module):
-    """
-    Mamba state-space model as a drop-in replacement for attention.
-    """
-
-    def __init__(self, config: TimeMoeConfig, layer_idx: Optional[int] = None):
-        super().__init__()
-        if not MAMBA_AVAILABLE:
-            msg = (
-                "Mamba is not available. Ensure the black_mamba folder is in the project root and "
-                "dependencies are installed: pip install causal_conv1d einops; "
-                "and build black_mamba if needed: pip install -e ./black_mamba"
-            )
-            if MAMBA_IMPORT_ERROR is not None:
-                raise ImportError(msg + f"\nOriginal error: {MAMBA_IMPORT_ERROR}") from MAMBA_IMPORT_ERROR
-            raise ImportError(msg)
-        
-        self.config = config
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        
-        # Create a MambaConfig object for MambaLayer
-        mamba_config = MambaConfig(
-            num_layers=getattr(config, "num_hidden_layers", 1),
-            hidden_size=config.hidden_size,
-            state_size=config.mamba_d_state,
-            expansion_factor=config.mamba_expand,
-            conv_dimension=config.mamba_d_conv,
-            conv_bias=True,
-            bias=True,
-            use_fast_path=True,
-            dt_rank="auto",
-            dt_min=0.001,
-            dt_max=0.1,
-            dt_init="random",
-            dt_scale=1.0,
-            dt_init_floor=1e-4,
-            rms_norm=True,
-            fused_add_norm=False,
-            residual_in_fp32=True,
-            hidden_dropout=0.0,
-            ffn_hidden_size=None,
-            gated_linear_unit=False,
-            mamba_moe_layers="",
-            routing_mode="sinkhorn",
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            fp32_residual_connection=False,
-            layernorm_epsilon=1e-5,
-            layernorm_zero_centered_gamma=False,
-            add_bias_linear=True,
-            activation_func=F.silu,
-            num_moe_experts=None,
-        )
-        
-        self.mamba_layer = MambaLayer(mamba_config, layer_idx=layer_idx)
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Cache] = None,
-            output_attentions: bool = False,
-            **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """
-        Forward pass for Mamba layer.
-        
-        Note: Mamba doesn't use attention_mask, position_ids, or past_key_value in the same way as attention.
-        These parameters are accepted for interface compatibility but are mostly ignored.
-        """
-        # Mamba processes the hidden states directly
-        # Convert inference_params if past_key_value is provided
-        inference_params = None
-        if past_key_value is not None:
-            # For mamba, we need to handle state caching differently
-            # This is a simplified version - full implementation would need proper state management
-            pass
-        
-        attn_output = self.mamba_layer(hidden_states, inference_params=inference_params)
-        
-        # Mamba doesn't produce attention weights, so return None
-        attn_weights = None
-        
-        # For mamba, past_key_value handling is different (uses inference_params internally)
-        # Return None for compatibility
-        return attn_output, attn_weights, None
-
-
 TIME_MOE_ATTENTION_CLASSES = {
     "eager": TimeMoeAttention,
-    'flash_attention_2': TimeMoeFlashAttention2,
-    'mamba': TimeMoeMamba,
+    "flash_attention_2": TimeMoeFlashAttention2,
 }
 
 
 class TimeMoeDecoderLayer(nn.Module):
     def __init__(self, config: TimeMoeConfig, layer_idx: int):
         super().__init__()
-        self.config = config
         self.hidden_size = config.hidden_size
 
-        # Use temporal_mixer to select Mamba vs attention; HF only allows eager/flash for _attn_implementation
-        if getattr(config, 'temporal_mixer', None) == 'mamba':
-            attn_cls = TimeMoeMamba
+        if config.temporal_mixer == "attn":
+            self.temporal_mixer = TIME_MOE_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        elif config.temporal_mixer == "mamba":
+            self.temporal_mixer = SimpleMambaMixer(config, layer_idx)
         else:
-            attn_cls = TIME_MOE_ATTENTION_CLASSES[config._attn_implementation]
-        self.self_attn = attn_cls(config, layer_idx)
+            raise ValueError(f"Unsupported temporal_mixer: {config.temporal_mixer}")
 
-        if self.config.use_dense:
-            self.ffn_layer = TimeMoeMLP(
-                hidden_size=self.config.hidden_size,
-                intermediate_size=self.config.intermediate_size,
-                hidden_act=self.config.hidden_act,
-            )
-        else:
-            self.ffn_layer = TimeMoeSparseExpertsLayer(config)
         self.input_layernorm = TimeMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = TimeMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # FIX: no layer_idx here
+        self.mlp = TimeMoeSparseExpertsLayer(config)
+
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_value: Optional[Tuple[torch.Tensor]] = None,
-            output_attentions: Optional[bool] = False,
-            use_cache: Optional[bool] = False,
-            **kwargs,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
-                "Please make sure use `attention_mask` instead.`"
-            )
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
-
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        **kwargs,
+    ):
+        # Temporal mixer block
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value = self.temporal_mixer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # MoE block
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.ffn_layer(hidden_states)
+
+        hidden_states, router_logits = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        if not output_attentions:
-            self_attn_weights = None
+        outputs = (hidden_states,)
 
-        if not use_cache:
-            present_key_value = None
-        return hidden_states, self_attn_weights, present_key_value, router_logits
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        outputs += (router_logits,)
+        return outputs
 
 
 class TimeMoePreTrainedModel(PreTrainedModel):

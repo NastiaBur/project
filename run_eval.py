@@ -12,6 +12,8 @@ from torch.utils.data import DistributedSampler, DataLoader
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM
+from time_moe.models.modeling_time_moe import TimeMoeForPrediction
+from time_moe.models.configuration_time_moe import TimeMoeConfig
 
 from time_moe.datasets.benchmark_dataset import BenchmarkEvalDataset, GeneralEvalDataset
 
@@ -82,63 +84,76 @@ class MAEMetric(SumEvalMetric):
 
 class TimeMoE:
     def __init__(self, model_path, device, context_length, prediction_length, temporal_mixer=None, **kwargs):
+        # Load config first
+        if temporal_mixer is not None:
+            config = TimeMoeConfig.from_pretrained(model_path)
+            config.temporal_mixer = temporal_mixer
+            # keep HF-compatible attention implementation
+            if temporal_mixer == "mamba":
+                config._attn_implementation = "eager"
+        else:
+            config = TimeMoeConfig.from_pretrained(model_path)
+
         try:
-            # Ensure black_mamba is on sys.path before loading Mamba model (must be before first time_moe import)
-            if temporal_mixer == 'mamba':
-                _eval_dir = os.path.dirname(os.path.abspath(__file__))
-                _black_mamba = os.path.join(_eval_dir, 'black_mamba')
-                if os.path.exists(_black_mamba) and _black_mamba not in sys.path:
-                    sys.path.insert(0, _black_mamba)
-            from time_moe.models.modeling_time_moe import TimeMoeForPrediction, MAMBA_AVAILABLE
-            from time_moe.models.configuration_time_moe import TimeMoeConfig
-            if temporal_mixer == 'mamba' and not MAMBA_AVAILABLE:
-                raise ImportError(
-                    "Mamba model requested (--temporal_mixer mamba) but black_mamba could not be loaded. "
-                    "Run from the project root so 'black_mamba' is found, install black_mamba deps (e.g. causal_conv1d, einops), "
-                    "and ensure CUDA extensions are built if needed."
-                )
-            load_kw = dict(device_map=device, dtype='auto')
-            if temporal_mixer is not None:
-                config = TimeMoeConfig.from_pretrained(model_path, temporal_mixer=temporal_mixer)
-                load_kw['config'] = config
-            model = TimeMoeForPrediction.from_pretrained(model_path, **load_kw)
-        except ImportError as e:
-            if "mamba" in str(e).lower() or "MAMBA" in str(e):
-                raise
-            model = AutoModelForCausalLM.from_pretrained(
+            model = TimeMoeForPrediction.from_pretrained(
                 model_path,
-                device_map=device,
-                dtype='auto',
-                trust_remote_code=True,
+                config=config,
+                dtype="auto",
             )
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Falling back to AutoModelForCausalLM due to: {e}")
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                device_map=device,
-                dtype='auto',
+                dtype="auto",
                 trust_remote_code=True,
             )
 
-        logging.info(f'>>> Model dtype: {model.dtype}; Temporal mixer: {getattr(model.config, "temporal_mixer", "N/A")}; Attention: {model.config._attn_implementation}')
+        model = model.to(device)
+        model.eval()
+
+        logging.info(
+            f'>>> Model dtype: {model.dtype}; '
+            f'Temporal mixer: {getattr(model.config, "temporal_mixer", "N/A")}; '
+            f'Attention: {getattr(model.config, "_attn_implementation", "N/A")}'
+        )
 
         self.model = model
         self.device = device
         self.prediction_length = prediction_length
-        self.model.eval()
+        self.temporal_mixer = getattr(model.config, "temporal_mixer", None)
 
     def predict(self, batch):
         model = self.model
         device = self.device
         prediction_length = self.prediction_length
 
-        outputs = model.generate(
-            inputs=batch['inputs'].to(device).to(model.dtype),
-            max_new_tokens=prediction_length,
+        inputs = batch["inputs"].to(device)
+        labels = batch["labels"].to(device)
+
+        if torch.is_floating_point(inputs):
+            inputs = inputs.to(model.dtype)
+
+        # Direct forecasting forward pass, not HF token generation
+        outputs = model(
+            input_ids=inputs,
+            max_horizon_length=prediction_length,
+            return_dict=True,
+            use_cache=False,
         )
-        preds = outputs[:, -prediction_length:]
-        labels = batch['labels'].to(device)
-        if len(preds.shape) > len(labels.shape):
-            labels = labels[..., None]
+
+        preds = outputs.logits  # expected shape: [B, seq_len, pred_len * input_size]
+
+        # For forecasting evaluation we usually want the prediction made at the last context step
+        preds = preds[:, -1, :]
+
+        # If input_size == 1 and labels are [B, pred_len, 1], squeeze them
+        if labels.ndim == 3 and labels.shape[-1] == 1:
+            labels = labels.squeeze(-1)
+
+        # If preds come out as [B, pred_len, 1], squeeze that too
+        if preds.ndim == 3 and preds.shape[-1] == 1:
+            preds = preds.squeeze(-1)
+
         return preds, labels
 
 
@@ -195,15 +210,21 @@ def evaluate(args):
         sampler = DistributedSampler(dataset=dataset, shuffle=False)
     else:
         sampler = None
-    test_dl = DataLoader(
+    num_workers = 2 if device != "cpu" else 0
+
+    dl_kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
         sampler=sampler,
         shuffle=False,
-        num_workers=2,
-        prefetch_factor=2,
+        num_workers=num_workers,
         drop_last=False,
     )
+
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = 2
+
+    test_dl = DataLoader(**dl_kwargs)
 
     acc_count = 0
     mse_per_batch = []
@@ -237,14 +258,21 @@ def evaluate(args):
         ret_metric[metric.name] = metric.value / acc_count
     print(f'{rank} - {ret_metric}')
 
-    metric_tensors = [metric.value for metric in metric_list] + [acc_count]
+    metric_tensors = []
+    for metric in metric_list:
+        if isinstance(metric.value, torch.Tensor):
+            metric_tensors.append(metric.value.detach().float().to(device))
+        else:
+            metric_tensors.append(torch.tensor(metric.value, dtype=torch.float32, device=device))
+
+    metric_tensors.append(torch.tensor(acc_count, dtype=torch.float32, device=device))
+
+    stat_tensor = torch.stack(metric_tensors)
+
     if is_dist:
-        stat_tensor = torch.tensor(metric_tensors).to(model.device)
-        gathered_results = [torch.zeros_like(stat_tensor) for _ in range(world_size)]
-        dist.all_gather(gathered_results, stat_tensor)
-        all_stat = torch.stack(gathered_results, dim=0).sum(dim=0)
-    else:
-        all_stat = metric_tensors
+        dist.all_reduce(stat_tensor, op=dist.ReduceOp.SUM)
+
+    all_stat = stat_tensor
 
     if rank == 0:
         item = {

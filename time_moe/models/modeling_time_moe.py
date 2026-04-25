@@ -102,12 +102,12 @@ class SimpleMambaMixer(nn.Module):
     ):
         B, L, D = hidden_states.shape
 
-        xz = self.in_proj(hidden_states)          # [B, L, 2*inner]
-        x, z = xz.chunk(2, dim=-1)                # [B, L, inner]
+        xz = self.in_proj(hidden_states)
+        x, z = xz.chunk(2, dim=-1)
 
-        x = x.transpose(1, 2)                     # [B, inner, L]
-        x = self.conv1d(x)[..., :L]               # causal crop
-        x = x.transpose(1, 2)                     # [B, L, inner]
+        x = x.transpose(1, 2)
+        x = self.conv1d(x)[..., :L]
+        x = x.transpose(1, 2)
 
         x = self.act(self.mix_proj(x))
         x = x * torch.sigmoid(z)
@@ -258,77 +258,52 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-class TimeMoeMambaMixer(nn.Module):
-    """
-    Mamba mixer used as a drop-in replacement for attention.
-    Input/output shape: [B, L, D]
-    """
 
-    def __init__(self, config: TimeMoeConfig, layer_idx: int):
+class TimeMoeMainEmbedding(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, hidden_act: str):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        # if not MAMBA_AVAILABLE:
-        #     msg = (
-        #         "temporal_mixer='mamba' requested, but BlackMamba is not available. "
-        #         "Install/build its CUDA dependencies first."
-        #     )
-        #     if MAMBA_IMPORT_ERROR is not None:
-        #         raise RuntimeError(msg + f"\nOriginal import error: {MAMBA_IMPORT_ERROR}") from MAMBA_IMPORT_ERROR
-        #     raise RuntimeError(msg)
-
-        mamba_config = MambaConfig(
-            num_layers=config.num_hidden_layers,
-            hidden_size=config.hidden_size,
-            state_size=config.mamba_d_state,
-            conv_dimension=config.mamba_d_conv,
-            expansion_factor=config.mamba_expand,
-            vocab_size=getattr(config, "vocab_size", 50000),
-            rms_norm=True,
-            fused_add_norm=False,
-            residual_in_fp32=True,
-            device="cuda",
-        )
-
-        self.mamba_layer = MambaLayer(mamba_config, layer_idx=layer_idx)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
-        # For now, ignore attention-specific args.
-        out = self.mamba_layer(hidden_states)
-
-        attn_weights = None
-        present_key_value = None
-        return out, attn_weights, present_key_value
-
-
-class TimeMoeInputEmbedding(nn.Module):
-    """
-    Use a mlp layer to embedding the time-series.
-    """
-
-    def __init__(self, config: TimeMoeConfig):
-        super().__init__()
-        self.config = config
-        self.input_size = config.input_size  # default 1
-        self.hidden_size = config.hidden_size
-        self.emb_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.emb_layer = nn.Linear(input_size, hidden_size, bias=False)
+        self.gate_layer = nn.Linear(input_size, hidden_size, bias=False)
+        self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
-        emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
-        return emb
+        return self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
+
+
+class TimeMoeMacroEmbedding(nn.Module):
+    def __init__(self, macro_input_size: int, hidden_size: int, hidden_act: str, dropout: float = 0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(macro_input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.act_fn = ACT2FN[hidden_act]
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act_fn(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+class TimeMoeCovariateFusion(nn.Module):
+    def __init__(self, hidden_size: int, mode: str = "add"):
+        super().__init__()
+        self.mode = mode
+        if mode == "gated_add":
+            self.gate = nn.Linear(hidden_size * 2, hidden_size)
+
+    def forward(self, main_emb, macro_emb=None):
+        if macro_emb is None:
+            return main_emb
+
+        if self.mode == "add":
+            return main_emb + macro_emb
+
+        if self.mode == "gated_add":
+            gate = torch.sigmoid(self.gate(torch.cat([main_emb, macro_emb], dim=-1)))
+            return main_emb + gate * macro_emb
+
+        raise ValueError(f"Unknown fusion mode: {self.mode}")
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -888,91 +863,105 @@ class TimeMoePreTrainedModel(PreTrainedModel):
 
 
 class TimeMoeModel(TimeMoePreTrainedModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`TimeMoeDecoderLayer`]
-
-    Args:
-        config: TimeMoeConfig
-    """
-
-    def __init__(self, config: TimeMoeConfig):
+    def __init__(self, config):
         super().__init__(config)
-        self.embed_layer = TimeMoeInputEmbedding(config)
+        self.padding_idx = None
+        self.config = config
+
+        self.main_embed_layer = TimeMoeMainEmbedding(
+            input_size=config.main_input_size,
+            hidden_size=config.hidden_size,
+            hidden_act=config.hidden_act,
+        )
+
+        self.use_macro_covariates = getattr(config, "use_macro_covariates", False)
+        if self.use_macro_covariates and config.macro_input_size > 0:
+            self.macro_embed_layer = TimeMoeMacroEmbedding(
+                macro_input_size=config.macro_input_size,
+                hidden_size=config.hidden_size,
+                hidden_act=config.hidden_act,
+                dropout=getattr(config, "macro_hidden_dropout", 0.1),
+            )
+        else:
+            self.macro_embed_layer = None
+
+        self.fusion_layer = TimeMoeCovariateFusion(
+            hidden_size=config.hidden_size,
+            mode=getattr(config, "macro_fusion", "add"),
+        )
+
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._attn_implementation = config._attn_implementation
         self.norm = TimeMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
-            self,
-            input_ids: torch.FloatTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, MoeModelOutputWithPast]:
-        # input_ids is the input of time series, its shape is [batch_size, seq_len, input_size]
+        self,
+        input_ids=None,
+        main_features=None,
+        macro_features=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            if len(input_ids.shape) == 2:
-                input_ids.unsqueeze_(dim=-1)
-            batch_size, seq_length, _ = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        if inputs_embeds is None:
+            if main_features is None:
+                if input_ids is None:
+                    raise ValueError("You must pass either main_features or input_ids.")
+                if input_ids.dim() == 2:
+                    input_ids = input_ids.unsqueeze(-1)
+                main_features = input_ids
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
+            if main_features.dim() == 2:
+                main_features = main_features.unsqueeze(-1)
+
+            main_embeds = self.main_embed_layer(main_features)
+
+            if self.macro_embed_layer is not None and macro_features is not None:
+                macro_embeds = self.macro_embed_layer(macro_features)
+            else:
+                macro_embeds = None
+
+            inputs_embeds = self.fusion_layer(main_embeds, macro_embeds)
+
+        batch_size, seq_length, _ = inputs_embeds.shape
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length),
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            )
+
+        attention_mask_2d = attention_mask
 
         past_key_values_length = 0
-
-        if use_cache:
-            use_legacy_cache = not isinstance(past_key_values, Cache)
-            if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            # get_usable_length() was deprecated/removed; use get_seq_length()
+        if use_cache and past_key_values is not None:
             past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-            position_ids = position_ids.view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            ).unsqueeze(0).expand(batch_size, -1)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_layer(input_ids)
-
-        # 4d mask is passed through the layers
-        attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask,
+        causal_attention_mask = _prepare_4d_causal_attention_mask(
+            attention_mask_2d,
             (batch_size, seq_length),
             inputs_embeds,
             past_key_values_length,
@@ -981,7 +970,6 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = ()
@@ -991,58 +979,45 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
 
             hidden_states = layer_outputs[0]
 
-            all_router_logits += (layer_outputs[-1],)
-
+            idx = 1
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[idx],)
+                idx += 1
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2]
+                next_decoder_cache = layer_outputs[idx]
+                idx += 1
+
+            all_router_logits += (layer_outputs[idx],)
 
         hidden_states = self.norm(hidden_states)
 
-        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = None
-        if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
-
         if not return_dict:
             return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
+                v for v in [hidden_states, next_decoder_cache, all_hidden_states, all_self_attns, all_router_logits]
                 if v is not None
             )
+
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=next_decoder_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            router_logits=all_router_logits
+            router_logits=all_router_logits,
         )
 
 
@@ -1106,30 +1081,30 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         return self.model
 
     def forward(
-            self,
-            input_ids: torch.FloatTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.FloatTensor] = None,
-            loss_masks: Optional[torch.FloatTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            max_horizon_length: Optional[int] = None,
-    ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
-
+        self,
+        input_ids=None,
+        main_features=None,
+        macro_features=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        loss_masks=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        max_horizon_length=None,
+    ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
+            main_features=main_features,
+            macro_features=macro_features,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1139,14 +1114,20 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        # outputs = model.generate(
+        #     main_features=main_features,        # [B, T, d_main]
+        #     macro_features=macro_features,      # [B, T, d_macro] or None
+        #     attention_mask=attention_mask,      # [B, T]
+        #     max_new_tokens=1,
+        #     use_cache=True,
+        # )
 
         hidden_states = outputs[0]
         predictions = None
-
         loss = None
         aux_loss = None
+
         if labels is not None:
-            # AutoRegressive loss
             ar_loss = 0.0
             for lm_head, horizon_length in zip(self.lm_heads, self.config.horizon_lengths):
                 one_predictions = lm_head(hidden_states)
@@ -1154,33 +1135,31 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                 ar_loss += one_loss
                 if predictions is None:
                     predictions = one_predictions
+
             loss = ar_loss / len(self.config.horizon_lengths)
 
             if self.apply_aux_loss:
                 router_logits = outputs.router_logits if return_dict else outputs[-1]
-
                 temporal_aux_loss = load_balancing_loss_func(
                     router_logits,
                     top_k=self.num_experts_per_tok,
                     num_experts=self.config.num_experts,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
                 )
                 loss += self.router_aux_loss_factor * temporal_aux_loss.to(loss.device)
         else:
             if max_horizon_length is None:
                 horizon_length = self.config.horizon_lengths[0]
-                max_horizon_length = horizon_length
             else:
-                horizon_length = self.config.horizon_lengths[0]
-                for h in self.config.horizon_lengths[1:]:
-                    if h > max_horizon_length:
-                        break
-                    else:
-                        horizon_length = h
+                if max_horizon_length not in self.horizon_length_map:
+                    raise ValueError(
+                        f"Requested max_horizon_length={max_horizon_length}, "
+                        f"but available horizons are {list(self.horizon_length_map.keys())}"
+                    )
+                horizon_length = max_horizon_length
+
             lm_head = self.lm_heads[self.horizon_length_map[horizon_length]]
             predictions = lm_head(hidden_states)
-            if horizon_length > max_horizon_length:
-                predictions = predictions[:, :, : self.config.input_size * max_horizon_length]
 
         if not return_dict:
             output = (predictions,) + outputs[1:]
@@ -1194,14 +1173,15 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    
 
     def calc_ar_loss(self, predictions, labels, loss_masks, horizon_length):
         if len(labels.shape) == 2:
-            labels.unsqueeze_(dim=-1)
+            labels = labels.unsqueeze(-1)
             # enable model parallelism
             labels = labels.to(predictions.device)
         if loss_masks is not None and len(loss_masks.shape) == 2:
-            loss_masks.unsqueeze_(dim=-1)
+            loss_masks = loss_masks.unsqueeze(-1)
             # enable model parallelism
             loss_masks = loss_masks.to(predictions.device)
 
@@ -1236,63 +1216,144 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             loss = losses.sum() / loss_masks.sum()
         else:
             loss = torch.mean(losses)
+        # Calculate loss with mask
+        # losses = self.ar_loss_fn(shift_predictions, shift_labels)
+
+        # # Tail-weighting: emphasize large absolute returns
+        # tail_scale = 0.01
+        # tail_cap = 5.0
+        # tail_alpha = 2.0
+
+        # weights = 1.0 + tail_alpha * torch.clamp(torch.abs(shift_labels) / tail_scale, max=tail_cap)
+
+        # losses = losses * weights
+
+        # if loss_masks is not None:
+        #     losses = losses * loss_masks
+        #     denom = (loss_masks * weights).sum()
+        #     loss = losses.sum() / torch.clamp(denom, min=1e-8)
+        # else:
+        #     loss = torch.mean(losses)
 
         return loss
 
     def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids=None,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        main_features=None,
+        macro_features=None,
+        **kwargs,
     ):
-        # Omit tokens covered by past_key_values
+        """
+        Generation-time input preparation with support for:
+        - legacy univariate input_ids
+        - main_features covariates
+        - macro_features covariates
+
+        Rules:
+        - first step: pass full sequence
+        - later steps with cache: pass only newly appended token(s)
+        - keep full attention_mask for visible context
+        """
+
+        def _get_seq_len(x):
+            if x is None:
+                return None
+            return x.shape[1]
+
+        def _slice_unprocessed(x, past_length, attention_mask_len=None):
+            if x is None:
+                return None
+
+            seq_len = x.shape[1]
+
+            # Case 1: attention_mask is longer than current x, meaning some context is already in cache
+            if attention_mask_len is not None and attention_mask_len > seq_len:
+                new_len = attention_mask_len - past_length
+                if new_len <= 0:
+                    new_len = 1
+                return x[:, -new_len:]
+
+            # Case 2: x still contains already-cached prefix
+            if past_length < seq_len:
+                return x[:, past_length:]
+
+            # Case 3: x already contains only fresh token(s)
+            return x
+
+        # infer current "token sequence" source
+        current_len = None
+        if input_ids is not None:
+            current_len = _get_seq_len(input_ids)
+        elif main_features is not None:
+            current_len = _get_seq_len(main_features)
+        elif inputs_embeds is not None:
+            current_len = _get_seq_len(inputs_embeds)
+
+        cache_length = 0
+        past_length = 0
+        max_cache_length = None
+
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                # if isinstance(past_key_values, DynamicCache):
-                #     past_length = past_key_values.seen_tokens
-                # else:
-                #     past_length = cache_length
-                # Use get_seq_length() for all Cache types (DynamicCache.seen_tokens was deprecated/removed)
                 past_length = cache_length
-
-                # get_max_length() may not exist on all Cache types (e.g. DynamicCache in newer transformers)
                 max_cache_length = getattr(past_key_values, "get_max_length", lambda: None)()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
 
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-            # input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+            attn_len = attention_mask.shape[1] if attention_mask is not None else None
 
-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            input_ids = _slice_unprocessed(input_ids, past_length, attn_len)
+            main_features = _slice_unprocessed(main_features, past_length, attn_len)
+            macro_features = _slice_unprocessed(macro_features, past_length, attn_len)
+
             if (
-                    max_cache_length is not None
-                    and attention_mask is not None
-                    and cache_length + input_ids.shape[1] > max_cache_length
+                max_cache_length is not None
+                and attention_mask is not None
+                and current_len is not None
+                and cache_length + current_len > max_cache_length
             ):
                 attention_mask = attention_mask[:, -max_cache_length:]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1]:]
 
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+            # choose the active step length from whichever input path is present
+            active_len = None
+            if input_ids is not None:
+                active_len = input_ids.shape[1]
+            elif main_features is not None:
+                active_len = main_features.shape[1]
+            elif inputs_embeds is not None:
+                active_len = inputs_embeds.shape[1]
+
+            if past_key_values is not None and active_len is not None:
+                position_ids = position_ids[:, -active_len:]
+
+        # inputs_embeds should only be used on the first step
         if inputs_embeds is not None and past_key_values is None:
-            logger.info('Use input_embedding')
+            logger.info("Use input_embedding")
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            model_inputs = {"input_ids": input_ids}
+            model_inputs = {}
+            if input_ids is not None:
+                model_inputs["input_ids"] = input_ids
+            if main_features is not None:
+                model_inputs["main_features"] = main_features
+            if macro_features is not None:
+                if main_features is not None and macro_features.shape[:2] != main_features.shape[:2]:
+                    raise ValueError(
+                        f"macro_features and main_features must match in batch/time dims, "
+                        f"got {macro_features.shape} vs {main_features.shape}"
+                    )
+                model_inputs["macro_features"] = macro_features
 
         model_inputs.update(
             {

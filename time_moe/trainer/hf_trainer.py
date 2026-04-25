@@ -15,7 +15,7 @@ from transformers import get_scheduler
 class TimeMoeTrainer(transformers.Trainer):
     epsilon = 1e-8
 
-    def __init__(self, label_column: str = 'labels', loss_mask_column: str = 'loss_mask', *positional_args, **kwargs):
+    def __init__(self, label_column: str = 'labels', loss_mask_column: str = 'loss_masks', *positional_args, **kwargs):
         super().__init__(*positional_args, **kwargs)
         self.tokenizer = kwargs.get("tokenizer", None)
         self.label_column = label_column

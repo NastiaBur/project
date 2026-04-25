@@ -11,10 +11,42 @@ import torch
 
 from time_moe.datasets.time_moe_dataset import TimeMoEDataset
 from time_moe.datasets.time_moe_window_dataset import TimeMoEWindowDataset
+from time_moe.datasets.general_covariate_dataset import GeneralCovariateDataset
+from time_moe.datasets.time_moe_covariate_window_dataset import TimeMoECovariateWindowDataset
 from time_moe.models.modeling_time_moe import TimeMoeForPrediction, TimeMoeConfig
 from time_moe.trainer.hf_trainer import TimeMoETrainingArguments, TimeMoeTrainer
 from time_moe.utils.dist_util import get_world_size
 from time_moe.utils.log_util import logger, log_in_local_rank_0
+
+import numpy as np
+
+
+class CovariateDataCollator:
+    def __call__(self, features):
+        batch = {}
+        keys = features[0].keys()
+
+        for key in keys:
+            values = [f[key] for f in features]
+
+            if key in {"main_features", "labels"}:
+                batch[key] = torch.tensor(np.array(values), dtype=torch.float32)
+            elif key == "macro_features":
+                batch[key] = torch.tensor(np.array(values), dtype=torch.float32)
+            elif key in {"loss_masks", "attention_mask"}:
+                batch[key] = torch.tensor(np.array(values), dtype=torch.long)
+            else:
+                batch[key] = torch.tensor(np.array(values))
+
+        if "attention_mask" not in batch:
+            if "loss_masks" in batch:
+                batch["attention_mask"] = (batch["loss_masks"] > 0).long()
+            elif "labels" in batch:
+                batch["attention_mask"] = torch.ones(
+                    batch["labels"].shape[:2], dtype=torch.long
+                )
+
+        return batch
 
 
 class TimeMoeRunner:
@@ -31,15 +63,22 @@ class TimeMoeRunner:
     def load_model(self, model_path: str = None, from_scatch: bool = False, **kwargs):
         if model_path is None:
             model_path = self.model_path
+
         temporal_mixer = kwargs.pop('temporal_mixer', None)
         attn = kwargs.pop('attn_implementation', None)
+
+        main_input_size = kwargs.pop('main_input_size', None)
+        macro_input_size = kwargs.pop('macro_input_size', None)
+        use_macro_covariates = kwargs.pop('use_macro_covariates', None)
+        macro_hidden_dropout = kwargs.pop('macro_hidden_dropout', None)
+        macro_fusion = kwargs.pop('macro_fusion', None)
+
         if temporal_mixer == 'mamba':
             attn = 'mamba'
             log_in_local_rank_0('Use Mamba temporal mixer')
         elif attn is None:
             attn = 'eager'
         elif attn == 'auto':
-            # try to use flash-attention
             try:
                 from flash_attn import flash_attn_func, flash_attn_varlen_func
                 from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -54,20 +93,32 @@ class TimeMoeRunner:
             log_in_local_rank_0('Use Flash Attention 2')
         elif attn != 'mamba':
             raise ValueError(f'Unknown attention method: {attn}')
+
         kwargs['attn_implementation'] = attn
 
+        config_kw = {}
+        if temporal_mixer is not None:
+            config_kw['temporal_mixer'] = temporal_mixer
+        if attn != 'mamba':
+            config_kw['_attn_implementation'] = attn
+
+        if main_input_size is not None:
+            config_kw['main_input_size'] = main_input_size
+        if macro_input_size is not None:
+            config_kw['macro_input_size'] = macro_input_size
+        if use_macro_covariates is not None:
+            config_kw['use_macro_covariates'] = use_macro_covariates
+        if macro_hidden_dropout is not None:
+            config_kw['macro_hidden_dropout'] = macro_hidden_dropout
+        if macro_fusion is not None:
+            config_kw['macro_fusion'] = macro_fusion
+
         if from_scatch:
-            config_kw = {}
-            if temporal_mixer is not None:
-                config_kw['temporal_mixer'] = temporal_mixer
-            # Don't set _attn_implementation when temporal_mixer is mamba - let config class handle it
-            # (it will set _attn_implementation='eager' for HF compatibility, but use temporal_mixer for layer selection)
-            if attn != 'mamba':
-                config_kw['_attn_implementation'] = attn
             config = TimeMoeConfig.from_pretrained(model_path, **config_kw)
             model = TimeMoeForPrediction(config)
         else:
-            model = TimeMoeForPrediction.from_pretrained(model_path, **kwargs)
+            model = TimeMoeForPrediction.from_pretrained(model_path, **config_kw, **kwargs)
+
         return model
 
     def train_model(self, from_scratch: bool = False, **kwargs):
@@ -184,6 +235,11 @@ class TimeMoeRunner:
                 torch_dtype=torch_dtype,
                 attn_implementation=train_config.get('attn_implementation', 'eager'),
                 temporal_mixer=train_config.get('temporal_mixer'),
+                main_input_size=train_config.get('main_input_size'),
+                macro_input_size=train_config.get('macro_input_size'),
+                use_macro_covariates=train_config.get('use_macro_covariates'),
+                macro_hidden_dropout=train_config.get('macro_hidden_dropout'),
+                macro_fusion=train_config.get('macro_fusion'),
             )
             log_in_local_rank_0(f'Load model parameters from: {model_path}')
         else:
@@ -212,11 +268,13 @@ class TimeMoeRunner:
             max_length=train_config["max_length"],
             stride=train_config["stride"],
             normalization_method=train_config["normalization_method"],
+            use_covariates=train_config.get("use_covariates", False),
         )
         trainer = TimeMoeTrainer(
             model=model,
             args=training_args,
             train_dataset=train_ds,
+            data_collator=CovariateDataCollator() if train_config.get("use_covariates", False) else None,
         )
 
         trainer.train()
@@ -225,11 +283,35 @@ class TimeMoeRunner:
 
         return trainer.model
 
-    def get_train_dataset(self, data_path, max_length, stride, normalization_method):
+    def get_train_dataset(
+        self,
+        data_path,
+        max_length,
+        stride,
+        normalization_method,
+        use_covariates=False,
+    ):
         log_in_local_rank_0('Loading dataset...')
-        dataset = TimeMoEDataset(data_path, normalization_method=normalization_method)
-        log_in_local_rank_0('Processing dataset to fixed-size sub-sequences...')
-        window_dataset = TimeMoEWindowDataset(dataset, context_length=max_length, prediction_length=0, stride=stride, shuffle=False)
+
+        if use_covariates:
+            dataset = GeneralCovariateDataset(data_path)
+            log_in_local_rank_0('Processing covariate-aware dataset to fixed-size sub-sequences...')
+            window_dataset = TimeMoECovariateWindowDataset(
+                dataset,
+                context_length=max_length,
+                prediction_length=0,
+                stride=stride,
+            )
+        else:
+            dataset = TimeMoEDataset(data_path, normalization_method=normalization_method)
+            log_in_local_rank_0('Processing dataset to fixed-size sub-sequences...')
+            window_dataset = TimeMoEWindowDataset(
+                dataset,
+                context_length=max_length,
+                prediction_length=0,
+                stride=stride,
+                shuffle=False,
+            )
         return window_dataset
 
 

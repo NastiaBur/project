@@ -44,7 +44,7 @@ SCRATCH_DIR=${SLURM_TMPDIR:-/tmp/$USER/$SLURM_JOB_ID}
 mkdir -p "$SCRATCH_DIR"
 
 # Data: copy to node-local storage for speed
-DATA_SRC=/home/aaburkova_1/project-1/dataset_finance/finetune/train_sequences.jsonl
+DATA_SRC=/home/aaburkova_1/project-1/dataset_finance_fred_features/finetune/train.jsonl
 DATA_DST=$SCRATCH_DIR/train_sequences.jsonl
 ls -lh "$DATA_SRC"
 cp "$DATA_SRC" "$DATA_DST"
@@ -57,7 +57,7 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export COMET_API_KEY="0Oz9BVkChPlRpa0Zh4OOQubGp"
 export COMET_PROJECT_NAME="time-moe-tuning"
 export COMET_WORKSPACE="s22d-burkova"
-export COMET_EXPERIMENT_NAME="time_moe_mamba_small"
+export COMET_EXPERIMENT_NAME="time_moe_mamba_fred_features"
 
 # IMPORTANT: run through the repo wrapper for single-node multi-GPU
 # (It will auto-call torchrun with nproc_per_node = visible GPUs)
@@ -66,11 +66,15 @@ srun "$PY" /home/aaburkova_1/project-1/torch_dist_run.py \
   -d "$DATA_DST" \
   --from_scratch \
   --train_steps 50000 \
-  --output_path /home/aaburkova_1/project-1/logs/time_moe_attn2_small \
+  --output_path /home/aaburkova_1/project-1/logs/time_moe_mamba_fred_features \
   --dataloader_num_workers 2 \
   --precision bf16 \
   --gradient_checkpointing \
   --micro_batch_size 8 \
   --global_batch_size 32 \
   --evaluation_strategy no \
-  --temporal_mixer attn
+  --temporal_mixer mamba \
+  --use_covariates \
+  --main_input_size 11 \
+  --macro_input_size 6 \
+  --macro_fusion add

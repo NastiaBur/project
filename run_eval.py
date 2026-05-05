@@ -16,6 +16,7 @@ from time_moe.models.modeling_time_moe import TimeMoeForPrediction
 from time_moe.models.configuration_time_moe import TimeMoeConfig
 
 from time_moe.datasets.benchmark_dataset import BenchmarkEvalDataset, GeneralEvalDataset
+from time_moe.datasets.general_covariate_dataset import GeneralCovariateEvalDataset
 
 
 def plot_eval_metrics(mse_per_batch, mae_per_batch, loss_per_batch, save_path):
@@ -82,6 +83,33 @@ class MAEMetric(SumEvalMetric):
         return torch.sum(torch.abs(preds - labels))
 
 
+class CovariateEvalCollator:
+    def __call__(self, features):
+
+        batch = {}
+
+        tensor_keys = {"main_features", "macro_features", "labels", "attention_mask"}
+        list_keys = {
+            "target_dates",
+            "ticker",
+            "forecast_origin_date",
+            "window_start_date",
+            "eval_start_date",
+        }
+
+        for key in features[0].keys():
+            vals = [f[key] for f in features]
+            if key in tensor_keys:
+                dtype = torch.float32 if key != "attention_mask" else torch.long
+                batch[key] = torch.tensor(np.array(vals), dtype=dtype)
+            elif key in list_keys:
+                batch[key] = vals
+            else:
+                batch[key] = vals
+
+        return batch
+
+
 class TimeMoE:
     def __init__(self, model_path, device, context_length, prediction_length, temporal_mixer=None, **kwargs):
         # Load config first
@@ -127,13 +155,69 @@ class TimeMoE:
         device = self.device
         prediction_length = self.prediction_length
 
+        if "main_features" in batch:
+            main_features = batch["main_features"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # Fix for models trained with a different main_input_size than dataset provides
+            expected_main_dim = getattr(model.config, "main_input_size", None)
+            if expected_main_dim is not None and main_features.shape[-1] != expected_main_dim:
+                if expected_main_dim == 1 and main_features.shape[-1] >= 1:
+                    # keep only the first channel, usually firm return
+                    main_features = main_features[..., :1]
+                else:
+                    raise ValueError(
+                        f"Model expects main_input_size={expected_main_dim}, "
+                        f"but batch main_features has shape {main_features.shape}"
+                    )
+
+            if torch.is_floating_point(main_features):
+                main_features = main_features.to(model.dtype)
+
+            macro_features = batch.get("macro_features", None)
+            if macro_features is not None:
+                macro_features = macro_features.to(device)
+                if torch.is_floating_point(macro_features):
+                    macro_features = macro_features.to(model.dtype)
+
+            outputs = model(
+                main_features=main_features,
+                macro_features=macro_features,
+                attention_mask=attention_mask,
+                max_horizon_length=prediction_length,
+                return_dict=True,
+                use_cache=False,
+            )
+
+            preds = outputs.logits  # expected [B, seq_len, prediction_length * input_size]
+            preds = preds[:, -1, :]  # last context position
+
+            # input_size = 1 -> [B, prediction_length]
+            if preds.ndim == 2:
+                if preds.shape[-1] == prediction_length:
+                    pass
+                elif preds.shape[-1] % prediction_length == 0:
+                    preds = preds.view(preds.shape[0], prediction_length, -1)
+                    if preds.shape[-1] == 1:
+                        preds = preds.squeeze(-1)
+                else:
+                    raise ValueError(
+                        f"Unexpected preds shape {preds.shape} for prediction_length={prediction_length}"
+                    )
+
+            if labels.ndim == 3 and labels.shape[-1] == 1:
+                labels = labels.squeeze(-1)
+
+            return preds, labels
+
+        # old path
         inputs = batch["inputs"].to(device)
         labels = batch["labels"].to(device)
 
         if torch.is_floating_point(inputs):
             inputs = inputs.to(model.dtype)
 
-        # Direct forecasting forward pass, not HF token generation
         outputs = model(
             input_ids=inputs,
             max_horizon_length=prediction_length,
@@ -141,21 +225,21 @@ class TimeMoE:
             use_cache=False,
         )
 
-        preds = outputs.logits  # expected shape: [B, seq_len, pred_len * input_size]
-
-        # For forecasting evaluation we usually want the prediction made at the last context step
+        preds = outputs.logits
         preds = preds[:, -1, :]
 
-        # If input_size == 1 and labels are [B, pred_len, 1], squeeze them
+        if preds.ndim == 2:
+            if preds.shape[-1] == prediction_length:
+                pass
+            elif preds.shape[-1] % prediction_length == 0:
+                preds = preds.view(preds.shape[0], prediction_length, -1)
+                if preds.shape[-1] == 1:
+                    preds = preds.squeeze(-1)
+
         if labels.ndim == 3 and labels.shape[-1] == 1:
             labels = labels.squeeze(-1)
 
-        # If preds come out as [B, pred_len, 1], squeeze that too
-        if preds.ndim == 3 and preds.shape[-1] == 1:
-            preds = preds.squeeze(-1)
-
         return preds, labels
-
 
 def evaluate(args):
     batch_size = args.batch_size
@@ -193,18 +277,29 @@ def evaluate(args):
         prediction_length=prediction_length,
         temporal_mixer=getattr(args, 'temporal_mixer', None),
     )
-    if args.data.endswith('.csv'):
+    if args.data.endswith(".jsonl") and args.use_covariates:
+        dataset = GeneralCovariateEvalDataset(
+            args.data,
+            context_length=context_length,
+            prediction_length=prediction_length,
+            window_stride=args.window_stride if args.window_stride is not None else prediction_length,
+            eval_only=True,
+        )
+        collator = CovariateEvalCollator()
+    elif args.data.endswith('.csv'):
         dataset = BenchmarkEvalDataset(
             args.data,
             context_length=context_length,
             prediction_length=prediction_length,
         )
+        collator = None
     else:
         dataset = GeneralEvalDataset(
             args.data,
             context_length=context_length,
             prediction_length=prediction_length,
         )
+        collator = None
 
     if torch.cuda.is_available() and dist.is_initialized():
         sampler = DistributedSampler(dataset=dataset, shuffle=False)
@@ -224,7 +319,10 @@ def evaluate(args):
     if num_workers > 0:
         dl_kwargs["prefetch_factor"] = 2
 
-    test_dl = DataLoader(**dl_kwargs)
+    test_dl = test_dl = DataLoader(
+        **dl_kwargs,
+        collate_fn=collator,
+    )
 
     acc_count = 0
     mse_per_batch = []
@@ -232,6 +330,11 @@ def evaluate(args):
     loss_per_batch = []
     all_preds = [] if (getattr(args, 'predictions_path', None) and (not is_dist or rank == 0)) else None
     all_labels = [] if all_preds is not None else None
+    all_dates = [] if all_preds is not None else None
+    all_tickers = [] if all_preds is not None else None
+    all_forecast_origin_dates = [] if all_preds is not None else None
+    all_window_start_dates = [] if all_preds is not None else None
+    all_eval_start_dates = [] if all_preds is not None else None
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(test_dl)):
             preds, labels = model.predict(batch)
@@ -252,6 +355,18 @@ def evaluate(args):
                 if all_preds is not None:
                     all_preds.append(preds.cpu())
                     all_labels.append(labels.cpu())
+
+                    if "target_dates" in batch:
+                        all_dates.extend(batch["target_dates"])
+                    if "ticker" in batch:
+                        all_tickers.extend(batch["ticker"])
+                    if "forecast_origin_date" in batch:
+                        all_forecast_origin_dates.extend(batch["forecast_origin_date"])
+                    if "window_start_date" in batch:
+                        all_window_start_dates.extend(batch["window_start_date"])
+                    if "eval_start_date" in batch:
+                        all_eval_start_dates.extend(batch["eval_start_date"])
+                    
 
     ret_metric = {}
     for metric in metric_list:
@@ -292,16 +407,66 @@ def evaluate(args):
             plot_eval_metrics(mse_per_batch, mae_per_batch, loss_per_batch, args.plot_path)
 
         if getattr(args, 'predictions_path', None) and all_preds is not None:
-            preds_arr = np.concatenate([p.numpy() for p in all_preds], axis=0)
-            labels_arr = np.concatenate([l.numpy() for l in all_labels], axis=0)
+            preds_arr = np.concatenate([p.double().numpy() for p in all_preds], axis=0)
+            labels_arr = np.concatenate([l.double().numpy() for l in all_labels], axis=0)
+
+            if all_dates is not None:
+                flat_dates = []
+                for x in all_dates:
+                    if isinstance(x, (list, tuple)):
+                        flat_dates.extend(x)
+                    else:
+                        flat_dates.append(x)
+                dates_arr = np.array(flat_dates, dtype=object)
+            else:
+                dates_arr = None
+            
+            if all_tickers is not None:
+                tickers_arr = np.array(all_tickers, dtype=object)
+            else:
+                tickers_arr = None
+            if all_forecast_origin_dates is not None:
+                forecast_origin_dates_arr = np.array(all_forecast_origin_dates, dtype=object)
+            else:
+                forecast_origin_dates_arr = None
+
+            if all_window_start_dates is not None:
+                window_start_dates_arr = np.array(all_window_start_dates, dtype=object)
+            else:
+                window_start_dates_arr = None
+
+            if all_eval_start_dates is not None:
+                eval_start_dates_arr = np.array(all_eval_start_dates, dtype=object)
+            else:
+                eval_start_dates_arr = None
+
             out_path = args.predictions_path.strip()
             if not out_path.endswith('.npz'):
                 out_path = out_path + '.npz'
             out_dir = os.path.dirname(out_path)
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            np.savez(out_path, predictions=preds_arr, labels=labels_arr)
-            logging.info(f'Saved predictions and labels to {out_path} (shape: predictions {preds_arr.shape}, labels {labels_arr.shape})')
+
+            save_dict = {
+                "predictions": preds_arr,
+                "labels": labels_arr,
+            }
+            if dates_arr is not None:
+                save_dict["dates"] = dates_arr
+            if tickers_arr is not None:
+                save_dict["tickers"] = tickers_arr
+            if forecast_origin_dates_arr is not None:
+                save_dict["forecast_origin_dates"] = forecast_origin_dates_arr
+            if window_start_dates_arr is not None:
+                save_dict["window_start_dates"] = window_start_dates_arr
+            if eval_start_dates_arr is not None:
+                save_dict["eval_start_dates"] = eval_start_dates_arr
+
+            np.savez(out_path, **save_dict)
+            logging.info(
+                f"Saved predictions/labels to {out_path} "
+                f"(predictions {preds_arr.shape}, labels {labels_arr.shape})"
+            )
 
 
 if __name__ == '__main__':
@@ -353,6 +518,23 @@ if __name__ == '__main__':
         default=None,
         choices=['attn', 'mamba'],
         help='Override architecture when loading the checkpoint. Usually not needed: the model uses the config saved in the checkpoint. Set to "mamba" if the checkpoint was trained with Mamba but config.json has temporal_mixer="attn".'
+    )
+    parser.add_argument(
+        "--use_covariates",
+        action="store_true",
+        help="Use covariate-aware evaluation dataset and model inputs"
+    )
+
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=None,
+        help="Stride between evaluation windows. Defaults to prediction_length when use_covariates eval_only is enabled."
+    )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="If set, only create windows whose targets lie in the eval period defined by eval_start_date/eval_length."
     )
     args = parser.parse_args()
     if args.context_length is None:

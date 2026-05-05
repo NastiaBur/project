@@ -159,6 +159,42 @@ if __name__ == "__main__":
         help="number of workers for dataloader",
     )
 
+    parser.add_argument(
+        "--use_covariates",
+        action="store_true",
+        help="Use covariate-aware dataset/model inputs",
+    )
+    parser.add_argument(
+        "--main_input_size",
+        type=int,
+        default=1,
+        help="Number of main features per time step",
+    )
+    parser.add_argument(
+        "--macro_input_size",
+        type=int,
+        default=0,
+        help="Number of macro covariates per time step",
+    )
+    parser.add_argument(
+        "--use_macro_covariates",
+        action="store_true",
+        help="Enable macro covariate branch in the model",
+    )
+    parser.add_argument(
+        "--macro_fusion",
+        type=str,
+        choices=["add", "gated_add"],
+        default="add",
+        help="How to fuse macro covariates with main features",
+    )
+    parser.add_argument(
+        "--macro_hidden_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout in macro embedding MLP",
+    )
+
     args = parser.parse_args()
 
     if args.normalization_method == "none":
@@ -203,4 +239,10 @@ if __name__ == "__main__":
         dataloader_num_workers=args.dataloader_num_workers,
         save_only_model=args.save_only_model,
         save_total_limit=args.save_total_limit,
+        use_covariates=args.use_covariates,
+        main_input_size=args.main_input_size,
+        macro_input_size=args.macro_input_size,
+        use_macro_covariates=args.use_macro_covariates,
+        macro_fusion=args.macro_fusion,
+        macro_hidden_dropout=args.macro_hidden_dropout,
     )

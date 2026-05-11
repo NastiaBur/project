@@ -133,6 +133,75 @@ def _predict_quantreg(res, X: pd.DataFrame) -> np.ndarray:
     Xc = sm.add_constant(X, has_constant="add")
     return np.asarray(res.predict(Xc), dtype=float)
 
+def _predict_quantreg_with_ci(
+    res,
+    X: pd.DataFrame,
+    z_value: float = 1.96,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      pred, se, lower_ci, upper_ci
+
+    CI is coefficient-based:
+      pred +/- z * sqrt(x' Cov(beta) x)
+    """
+    Xc = sm.add_constant(X, has_constant="add")
+    Xv = np.asarray(Xc, dtype=float)
+
+    pred = np.asarray(res.predict(Xc), dtype=float)
+
+    cov = res.cov_params()
+    if isinstance(cov, pd.DataFrame):
+        cov = cov.values
+    cov = np.asarray(cov, dtype=float)
+
+    # diag(X Cov X')
+    var_pred = np.einsum("ij,jk,ik->i", Xv, cov, Xv)
+    var_pred = np.maximum(var_pred, 0.0)
+    se = np.sqrt(var_pred)
+
+    lower = pred - z_value * se
+    upper = pred + z_value * se
+    return pred, se, lower, upper
+
+
+def _linear_combo_ci_from_same_model(
+    res,
+    X_left: pd.DataFrame,
+    X_right: pd.DataFrame,
+    z_value: float = 1.96,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    For quantities of the form:
+      diff = x_left' beta - x_right' beta = (x_left - x_right)' beta
+
+    Returns:
+      diff, se, lower_ci, upper_ci
+    """
+    Xl = sm.add_constant(X_left, has_constant="add")
+    Xr = sm.add_constant(X_right, has_constant="add")
+
+    Xlv = np.asarray(Xl, dtype=float)
+    Xrv = np.asarray(Xr, dtype=float)
+    Xdv = Xlv - Xrv
+
+    pred_left = np.asarray(res.predict(Xl), dtype=float)
+    pred_right = np.asarray(res.predict(Xr), dtype=float)
+    diff = pred_left - pred_right
+
+    cov = res.cov_params()
+    if isinstance(cov, pd.DataFrame):
+        cov = cov.values
+    cov = np.asarray(cov, dtype=float)
+
+    var_diff = np.einsum("ij,jk,ik->i", Xdv, cov, Xdv)
+    var_diff = np.maximum(var_diff, 0.0)
+    se = np.sqrt(var_diff)
+
+    lower = diff - z_value * se
+    upper = diff + z_value * se
+    return diff, se, lower, upper
+
 
 # =========================================================
 # Main computation
@@ -151,6 +220,7 @@ def compute_quantile_regression_covar(
     warmup: int = 252,
     step: int = 1,
     show_progress: bool = True,
+    z_value: float = 1.96,
 ) -> pd.DataFrame:
     """
     Two-step QR CoVaR in the spirit of Adrian & Brunnermeier.
@@ -240,8 +310,19 @@ def compute_quantile_regression_covar(
             continue
 
         X_i_test = test_row[control_cols]
-        var_i_t = float(_predict_quantreg(res_i_var, X_i_test)[0])
-        med_i_t = float(_predict_quantreg(res_i_med, X_i_test)[0])
+
+        try:
+            var_i_pred, var_i_se, var_i_lower, var_i_upper = _predict_quantreg_with_ci(
+                res_i_var, X_i_test, z_value=z_value
+            )
+            med_i_pred, med_i_se, med_i_lower, med_i_upper = _predict_quantreg_with_ci(
+                res_i_med, X_i_test, z_value=z_value
+            )
+        except Exception:
+            continue
+
+        var_i_t = float(var_i_pred[0])
+        med_i_t = float(med_i_pred[0])
 
         # -------- Step 2: system QR on institution state + controls --------
         sys_features = ["institution_state"] + control_cols
@@ -253,22 +334,68 @@ def compute_quantile_regression_covar(
         except Exception:
             continue
 
-        # Build two counterfactual rows:
         # distress state = VaR_i_t
-        # median state   = Median_i_t
         X_s_distress = test_row[control_cols].copy()
         X_s_distress.insert(0, "institution_state", var_i_t)
 
+        # median state = Median_i_t
         X_s_median = test_row[control_cols].copy()
         X_s_median.insert(0, "institution_state", med_i_t)
 
         try:
-            covar_distress_t = float(_predict_quantreg(res_s, X_s_distress)[0])
-            covar_median_t = float(_predict_quantreg(res_s, X_s_median)[0])
+            covar_pred, covar_se, covar_lower, covar_upper = _predict_quantreg_with_ci(
+                res_s, X_s_distress, z_value=z_value
+            )
+            covar_med_pred, covar_med_se, covar_med_lower, covar_med_upper = _predict_quantreg_with_ci(
+                res_s, X_s_median, z_value=z_value
+            )
+
+            delta_pred, delta_se, delta_lower, delta_upper = _linear_combo_ci_from_same_model(
+                res_s, X_s_distress, X_s_median, z_value=z_value
+            )
         except Exception:
             continue
 
-        delta_covar_t = covar_distress_t - covar_median_t
+        covar_distress_t = float(covar_pred[0])
+        covar_median_t = float(covar_med_pred[0])
+        delta_covar_t = float(delta_pred[0])
+
+        rows.append({
+            "date": pd.to_datetime(test_row["date"].iloc[0]),
+            "firm_true": float(test_row["true"].iloc[0]),
+            "firm_pred": float(test_row["pred"].iloc[0]),
+            "institution_state": float(test_row["institution_state"].iloc[0]),
+            "system_ret": float(test_row["system_ret"].iloc[0]),
+
+            "var_qr": var_i_t,
+            "var_qr_se": float(var_i_se[0]),
+            "var_qr_lower_ci": float(var_i_lower[0]),
+            "var_qr_upper_ci": float(var_i_upper[0]),
+
+            "median_qr": med_i_t,
+            "median_qr_se": float(med_i_se[0]),
+            "median_qr_lower_ci": float(med_i_lower[0]),
+            "median_qr_upper_ci": float(med_i_upper[0]),
+
+            "covar_qr": covar_distress_t,
+            "covar_qr_se": float(covar_se[0]),
+            "covar_qr_lower_ci": float(covar_lower[0]),
+            "covar_qr_upper_ci": float(covar_upper[0]),
+
+            "covar_median_qr": covar_median_t,
+            "covar_median_qr_se": float(covar_med_se[0]),
+            "covar_median_qr_lower_ci": float(covar_med_lower[0]),
+            "covar_median_qr_upper_ci": float(covar_med_upper[0]),
+
+            "delta_covar_qr": delta_covar_t,
+            "delta_covar_qr_se": float(delta_se[0]),
+            "delta_covar_qr_lower_ci": float(delta_lower[0]),
+            "delta_covar_qr_upper_ci": float(delta_upper[0]),
+
+            "q": q,
+            "institution_mode": institution_mode,
+            "ticker": ticker,
+        })
 
         rows.append({
             "date": pd.to_datetime(test_row["date"].iloc[0]),
@@ -302,6 +429,7 @@ def compute_reference_quantile_regression_covar(
     warmup: int = 252,
     step: int = 1,
     show_progress: bool = True,
+    z_value: float = 1.96,
 ) -> pd.DataFrame:
     """
     Convenience wrapper:
@@ -319,6 +447,7 @@ def compute_reference_quantile_regression_covar(
         warmup=warmup,
         step=step,
         show_progress=show_progress,
+        z_value=z_value,
     )
 
 
@@ -340,6 +469,45 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     if np.nanstd(x) <= 1e-12 or np.nanstd(y) <= 1e-12:
         return float("nan")
     return float(np.corrcoef(x, y)[0, 1])
+
+def _rolling_quantile_band(
+    center: pd.Series,
+    residual: pd.Series,
+    window: int = 60,
+    min_periods: int = 20,
+    alpha: float = 0.10,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Build an empirical uncertainty band around `center`
+    using rolling quantiles of `residual`.
+
+    Band:
+      lower = center + rolling_quantile(residual, alpha/2)
+      upper = center + rolling_quantile(residual, 1 - alpha/2)
+
+    Example:
+      alpha=0.10 -> central 90% band
+    """
+    q_low = alpha / 2.0
+    q_high = 1.0 - alpha / 2.0
+
+    low_resid = residual.rolling(window=window, min_periods=min_periods).quantile(q_low)
+    high_resid = residual.rolling(window=window, min_periods=min_periods).quantile(q_high)
+
+    # fallback for early rows
+    if low_resid.notna().sum() > 0:
+        low_resid = low_resid.fillna(low_resid.dropna().iloc[0])
+    else:
+        low_resid = pd.Series(np.full(len(residual), np.nanquantile(residual, q_low)), index=residual.index)
+
+    if high_resid.notna().sum() > 0:
+        high_resid = high_resid.fillna(high_resid.dropna().iloc[0])
+    else:
+        high_resid = pd.Series(np.full(len(residual), np.nanquantile(residual, q_high)), index=residual.index)
+
+    lower = center + low_resid
+    upper = center + high_resid
+    return lower, upper
 
 
 def evaluate_covar_tracking(
@@ -418,6 +586,100 @@ def evaluate_covar_tracking(
     }
     return out
 
+def add_covar_uncertainty_bands(
+    qr_df: pd.DataFrame,
+    *,
+    window: int = 60,
+    min_periods: int = 20,
+    alpha: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Add empirical uncertainty bands for CoVaR based on rolling residuals:
+
+      residual_covar = system_ret - covar_qr
+
+    Produces:
+      covar_band_lower
+      covar_band_upper
+    """
+    x = qr_df.copy().sort_values("date").reset_index(drop=True)
+
+    required = {"system_ret", "covar_qr"}
+    missing = required - set(x.columns)
+    if missing:
+        raise ValueError(f"Missing columns for CoVaR band: {missing}")
+
+    resid = x["system_ret"] - x["covar_qr"]
+    lower, upper = _rolling_quantile_band(
+        center=x["covar_qr"],
+        residual=resid,
+        window=window,
+        min_periods=min_periods,
+        alpha=alpha,
+    )
+
+    x["covar_tracking_resid"] = resid
+    x["covar_band_lower"] = lower
+    x["covar_band_upper"] = upper
+    return x
+
+def add_delta_covar_uncertainty_bands(
+    qr_df: pd.DataFrame,
+    reference_qr_df: pd.DataFrame,
+    *,
+    window: int = 60,
+    min_periods: int = 20,
+    alpha: float = 0.10,
+    ticker: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Add empirical uncertainty bands for Delta-CoVaR based on rolling residuals
+    versus a reference Delta-CoVaR series.
+
+      residual_delta = delta_covar_qr_pred - delta_covar_qr_ref
+
+    Produces:
+      delta_covar_band_lower
+      delta_covar_band_upper
+    """
+    pred = qr_df.copy()
+    ref = reference_qr_df.copy()
+
+    if ticker is not None:
+        if "ticker" in pred.columns:
+            pred = pred[pred["ticker"] == ticker].copy()
+        if "ticker" in ref.columns:
+            ref = ref[ref["ticker"] == ticker].copy()
+
+    pred["date"] = pd.to_datetime(pred["date"])
+    ref["date"] = pd.to_datetime(ref["date"])
+
+    merged = pred.merge(
+        ref[["date", "delta_covar_qr"]],
+        on="date",
+        how="left",
+        suffixes=("", "_ref"),
+    ).sort_values("date").reset_index(drop=True)
+
+    if "delta_covar_qr" not in merged.columns or "delta_covar_qr_ref" not in merged.columns:
+        raise ValueError("Could not align predicted and reference delta_covar_qr.")
+
+    resid = merged["delta_covar_qr"] - merged["delta_covar_qr_ref"]
+
+    lower, upper = _rolling_quantile_band(
+        center=merged["delta_covar_qr"],
+        residual=resid,
+        window=window,
+        min_periods=min_periods,
+        alpha=alpha,
+    )
+
+    merged["delta_covar_tracking_resid"] = resid
+    merged["delta_covar_band_lower"] = lower
+    merged["delta_covar_band_upper"] = upper
+    return merged
+
+
 # =========================================================
 # Plotting
 # =========================================================
@@ -425,12 +687,13 @@ def evaluate_covar_tracking(
 def plot_qr_var(
     qr_df_1: pd.DataFrame,
     qr_df_2: Optional[pd.DataFrame] = None,
-    *,
     model_1_name: str = "Model 1",
     model_2_name: str = "Model 2",
     ticker: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    show_confidence_band: bool = False,
+    band_alpha: float = 0.18,
     save_path: Optional[Union[str, Path]] = None,
     figsize: tuple[int, int] = (14, 6),
 ):
@@ -463,42 +726,66 @@ def plot_qr_var(
 
     plt.figure(figsize=figsize)
     plt.plot(x1["date"], x1["firm_true"], label="True firm return", linewidth=1.2)
-    # plt.plot(x1["date"], x1["firm_pred"], label=f"{model_1_name}: mean prediction", linewidth=1.2)
     plt.plot(x1["date"], x1["var_qr"], label=f"{model_1_name}: QR-VaR", linewidth=1.4, linestyle="--")
 
+    if show_confidence_band and {"var_qr_lower_ci", "var_qr_upper_ci"}.issubset(x1.columns):
+        plt.fill_between(
+            x1["date"],
+            x1["var_qr_lower_ci"],
+            x1["var_qr_upper_ci"],
+            alpha=band_alpha,
+            label=f"{model_1_name}: 95% CI",
+        )
+
     if x2 is not None:
-        # plt.plot(x2["date"], x2["firm_pred"], label=f"{model_2_name}: mean prediction", linewidth=1.2)
         plt.plot(x2["date"], x2["var_qr"], label=f"{model_2_name}: QR-VaR", linewidth=1.4, linestyle='dotted')
 
-    title = "Quantile-regression VaR"
+        if show_confidence_band and {"var_qr_lower_ci", "var_qr_upper_ci"}.issubset(x2.columns):
+            plt.fill_between(
+                x2["date"],
+                x2["var_qr_lower_ci"],
+                x2["var_qr_upper_ci"],
+                alpha=band_alpha,
+                label=f"{model_2_name}: 95% CI",
+            )
+    title = "Quantile-regression VaR" 
     if ticker is not None:
         title += f" | {ticker}"
-
     plt.title(title)
     plt.xlabel("Date")
-    plt.ylabel("Return / VaR threshold")
+    plt.ylabel("VaR")
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
 
-    if save_path is not None:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to: {save_path}")
-    else:
+    if save_path is not None: 
+        save_path = Path(save_path) 
+        save_path.parent.mkdir(parents=True, exist_ok=True) 
+        plt.savefig(save_path, dpi=150, bbox_inches="tight") 
+        print(f"Saved plot to: {save_path}") 
+    else: 
         plt.show()
 
 
 def plot_qr_covar(
     qr_df_1: pd.DataFrame,
     qr_df_2: Optional[pd.DataFrame] = None,
-    *,
+    # model_1_name: str = "Model 1",
+    # model_2_name: str = "Model 2",
+    # ticker: Optional[str] = None,
+    # start_date: Optional[str] = None,
+    # end_date: Optional[str] = None,
+    # show_confidence_band: bool = False,
+    # band_alpha: float = 0.18,
+    # save_path: Optional[Union[str, Path]] = None,
+    # figsize: tuple[int, int] = (14, 6),
     model_1_name: str = "Model 1",
     model_2_name: str = "Model 2",
     ticker: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    show_confidence_band: bool = False,
+    band_alpha: float = 0.18,
     save_path: Optional[Union[str, Path]] = None,
     figsize: tuple[int, int] = (14, 6),
 ):
@@ -532,41 +819,58 @@ def plot_qr_covar(
     plt.figure(figsize=figsize)
     plt.plot(x1["date"], x1["system_ret"], label="True system return", linewidth=1.2)
     plt.plot(x1["date"], x1["covar_qr"], label=f"{model_1_name}: CoVaR", linewidth=1.4)
-    # plt.plot(x1["date"], x1["covar_median_qr"], label=f"{model_1_name}: CoVaR median-state", linewidth=1.2, linestyle="--")
+
+    if show_confidence_band and {"covar_band_lower", "covar_band_upper"}.issubset(x1.columns):
+        plt.fill_between(
+            x1["date"],
+            x1["covar_band_lower"],
+            x1["covar_band_upper"],
+            alpha=band_alpha,
+            label=f"{model_1_name}: uncertainty band",
+        )
 
     if x2 is not None:
         plt.plot(x2["date"], x2["covar_qr"], label=f"{model_2_name}: CoVaR", linewidth=1.4)
-        # plt.plot(x2["date"], x2["covar_median_qr"], label=f"{model_2_name}: CoVaR median-state", linewidth=1.2, linestyle="--")
 
-    title = "Quantile-regression CoVaR"
+        if show_confidence_band and {"covar_band_lower", "covar_band_upper"}.issubset(x2.columns):
+            plt.fill_between(
+                x2["date"],
+                x2["covar_band_lower"],
+                x2["covar_band_upper"],
+                alpha=band_alpha,
+                label=f"{model_2_name}: uncertainty band",
+            )
+
+    title = "Quantile-regression CoVaR" 
     if ticker is not None:
         title += f" | {ticker}"
-
     plt.title(title)
     plt.xlabel("Date")
-    plt.ylabel("System return / CoVaR threshold")
+    plt.ylabel("CoVaR")
+    plt.ylim(-1.3, 1.3)
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
 
-    if save_path is not None:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to: {save_path}")
-    else:
+    if save_path is not None: 
+        save_path = Path(save_path) 
+        save_path.parent.mkdir(parents=True, exist_ok=True) 
+        plt.savefig(save_path, dpi=150, bbox_inches="tight") 
+        print(f"Saved plot to: {save_path}") 
+    else: 
         plt.show()
 
 
 def plot_qr_delta_covar(
     qr_df_1: pd.DataFrame,
     qr_df_2: Optional[pd.DataFrame] = None,
-    *,
     model_1_name: str = "Model 1",
     model_2_name: str = "Model 2",
     ticker: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    show_confidence_band: bool = False,
+    band_alpha: float = 0.18,
     save_path: Optional[Union[str, Path]] = None,
     figsize: tuple[int, int] = (14, 5),
 ):
@@ -600,13 +904,29 @@ def plot_qr_delta_covar(
     plt.figure(figsize=figsize)
     plt.plot(x1["date"], x1["delta_covar_qr"], label=f"{model_1_name}: ΔCoVaR", linewidth=1.4)
 
+    if show_confidence_band and {"delta_covar_band_lower", "delta_covar_band_upper"}.issubset(x1.columns):
+        plt.fill_between(
+            x1["date"],
+            x1["delta_covar_band_lower"],
+            x1["delta_covar_band_upper"],
+            alpha=band_alpha,
+            label=f"{model_1_name}: uncertainty band",
+        )
+
     if x2 is not None:
         plt.plot(x2["date"], x2["delta_covar_qr"], label=f"{model_2_name}: ΔCoVaR", linewidth=1.4)
 
-    title = "Quantile-regression ΔCoVaR"
+        if show_confidence_band and {"delta_covar_band_lower", "delta_covar_band_upper"}.issubset(x2.columns):
+            plt.fill_between(
+                x2["date"],
+                x2["delta_covar_band_lower"],
+                x2["delta_covar_band_upper"],
+                alpha=band_alpha,
+                label=f"{model_2_name}: uncertainty band",
+            )
+    title = "Quantile-regression ΔCoVaR" 
     if ticker is not None:
         title += f" | {ticker}"
-
     plt.title(title)
     plt.xlabel("Date")
     plt.ylabel("ΔCoVaR")
@@ -614,10 +934,10 @@ def plot_qr_delta_covar(
     plt.legend()
     plt.tight_layout()
 
-    if save_path is not None:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to: {save_path}")
-    else:
+    if save_path is not None: 
+        save_path = Path(save_path) 
+        save_path.parent.mkdir(parents=True, exist_ok=True) 
+        plt.savefig(save_path, dpi=150, bbox_inches="tight") 
+        print(f"Saved plot to: {save_path}") 
+    else: 
         plt.show()
